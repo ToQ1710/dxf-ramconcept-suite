@@ -180,6 +180,298 @@ def _clean_polygon(pts, dup_tol=0.002, col_tol=0.001):
     return out if len(out) >= 3 else None
 
 
+def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn):
+    """Chia mỗi tấm sàn thành nhiều VÙNG theo nét STEP / SOFFIT STEP, rồi gán
+    bề dày (SLAB_DEPTH) và cao độ TOC cho từng vùng.
+
+    Quy ước (đã chốt với người dùng):
+      • STEP   = bậc MẶT TRÊN  -> qua STEP đổi TOC.
+      • SOFFIT STEP = bậc ĐÁY  -> qua SOFFIT chỉ đổi bề dày, TOC GIỮ NGUYÊN.
+      • Bề dày: callout SLAB_DEPTH; ưu tiên ĐÍCH LEADER (circle) khi có, vì text
+        hexagon có thể nằm ở vùng khác (leader trỏ sang vùng thật).
+      • Cao độ TOC: nếu có S.F.L tuyệt đối ("+119.350") -> lấy cao nhất = 0.
+        Nếu KHÔNG có S.F.L -> dùng BƯỚC NHẢY trên layer STRUCTURAL FINISH FLOOR
+        (số nằm trên sàn THẤP hơn = độ chênh mm); vùng cao nhất = 0.
+        Vùng chỉ ngăn bởi SOFFIT dùng chung TOC (lan truyền).
+      • Có cả S.F.L lẫn step-jump -> kiểm tra chéo, lệch thì cảnh báo.
+
+    Trả về danh sách slab-dict mới (giữ nguyên slab không có callout bên trong).
+    """
+    try:
+        from shapely.geometry import Polygon, LineString, Point
+        from shapely.ops import unary_union, polygonize
+    except Exception:
+        log_fn("  ⚠ shapely chưa cài → bỏ qua auto-detect slab depth", "warning")
+        return slabs
+
+    import math as _m
+    s = unit_scale
+
+    def q(layer, etype):
+        return msp.query('%s[layer=="%s"]' % (etype, layer))
+
+    def _ring(e):
+        pts = [(p[0]*s, p[1]*s) for p in e.get_points("xy")]
+        if getattr(e, "is_closed", False) and pts and pts[0] != pts[-1]:
+            pts.append(pts[0])           # đóng vòng cho polyline kín (vd ô soffit)
+        return pts
+
+    def collect_lines(layer):
+        out = []
+        for e in q(layer, "LWPOLYLINE"):
+            pts = _ring(e)
+            if len(pts) >= 2:
+                out.append(LineString(pts))
+        return out
+
+    step_l  = layers.get("step",   "STEP")
+    soff_l  = layers.get("soffit", "SOFFIT STEP")
+    depth_l = layers.get("depth",  "SLAB_DEPTH")
+    sfl_l   = layers.get("sfl",    "STRUCTURAL FINISH FLOOR")
+
+    steps = collect_lines(step_l)
+    soffs = collect_lines(soff_l)
+
+    def _d(a, b):
+        return _m.hypot(a[0]-b[0], a[1]-b[1])
+
+    # ── Callout bề dày: pairing theo CIRCLE (đích leader thật) ──
+    dtexts = []
+    for t in q(depth_l, "TEXT"):
+        try:
+            v = int(round(float(t.dxf.text.strip())))
+        except (ValueError, TypeError):
+            continue
+        dtexts.append((v, (t.dxf.insert.x*s, t.dxf.insert.y*s)))
+    circles = [(c.dxf.center.x*s, c.dxf.center.y*s) for c in q(depth_l, "CIRCLE")]
+    segs = []                            # đoạn leader ứng viên (LINE + polyline hở)
+    for e in q(depth_l, "LINE"):
+        segs.append(((e.dxf.start.x*s, e.dxf.start.y*s),
+                     (e.dxf.end.x*s,   e.dxf.end.y*s)))
+    for e in q(depth_l, "LWPOLYLINE"):
+        if not getattr(e, "is_closed", False):
+            pts = _ring(e)
+            if len(pts) >= 2:
+                segs.append((pts[0], pts[-1]))
+
+    depth_pts = []
+    used = set()
+    for c in circles:
+        leader = None
+        for sg in segs:                  # leader = đoạn có 1 đầu CHẠM circle
+            if _d(sg[0], c) <= 0.12 or _d(sg[1], c) <= 0.12:
+                leader = sg
+                break
+        if leader is None:
+            continue
+        far = leader[1] if _d(leader[0], c) <= _d(leader[1], c) else leader[0]
+        if dtexts:
+            ti = min(range(len(dtexts)), key=lambda i: _d(dtexts[i][1], far))
+            if _d(dtexts[ti][1], far) <= 2.0:
+                depth_pts.append((dtexts[ti][0], Point(c)))
+                used.add(ti)
+    for i, (v, tp) in enumerate(dtexts):
+        if i not in used:                # text không có leader -> dùng chính vị trí
+            depth_pts.append((v, Point(tp)))
+
+    if not depth_pts:
+        log_fn("  ⚠ Không thấy callout SLAB_DEPTH → bỏ qua auto-detect", "warning")
+        return slabs
+
+    # ── Cao độ: S.F.L tuyệt đối ("+119.350") và bước nhảy (số thường) ──
+    sfl_pts, step_pts = [], []
+    for t in q(sfl_l, "TEXT"):
+        txt = t.dxf.text.strip()
+        p = (t.dxf.insert.x*s, t.dxf.insert.y*s)
+        if txt.startswith("+"):
+            try:
+                sfl_pts.append((float(txt.replace("+", "")), Point(p)))
+            except ValueError:
+                pass
+        else:
+            try:
+                step_pts.append((int(round(float(txt))), Point(p)))
+            except ValueError:
+                pass
+    datum_sfl = max((v for v, _ in sfl_pts), default=None)
+
+    log_fn(f"  Slab-depth: {len(depth_pts)} callout, {len(sfl_pts)} S.F.L, "
+           f"{len(step_pts)} step-jump, {len(steps)} STEP, {len(soffs)} SOFFIT", "info")
+
+    def snap_ends(ls, boundary, tol=0.25):
+        pts = list(ls.coords)
+        for idx in (0, -1):
+            p = Point(pts[idx])
+            if boundary.distance(p) <= tol:
+                pr = boundary.interpolate(boundary.project(p))
+                pts[idx] = (pr.x, pr.y)
+        return LineString(pts)
+
+    out_slabs = []
+    region_no = 0
+    for sd in slabs:
+        base_pr  = sd.get("priority", 1)
+        base_t   = sd.get("thickness", 200)
+        base_toc = sd.get("toc", 0)
+        try:
+            poly = Polygon(sd["pts"])
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+        except Exception:
+            out_slabs.append(sd); continue
+
+        # Chỉ subdivide slab CÓ callout bên trong (bỏ bản vẽ phụ không callout)
+        if poly.is_empty or not any(poly.contains(p) for _, p in depth_pts):
+            out_slabs.append(sd); continue
+
+        rstep = [l for l in steps if l.intersects(poly)]
+        rsoff = [l for l in soffs if l.intersects(poly)]
+        cut = [snap_ends(l, poly.boundary) for l in rstep + rsoff]
+        if cut:
+            merged = unary_union([poly.boundary] + cut)
+            regions = [g for g in polygonize(merged)
+                       if poly.buffer(-0.005).contains(g.representative_point())]
+        else:
+            regions = [poly]
+        if not regions:
+            regions = [poly]
+        n = len(regions)
+        cent = [g.representative_point() for g in regions]
+
+        def near_val(pts, g, c):
+            cand = [(v, p) for v, p in pts if g.contains(p)]
+            if not cand:
+                return None, 0
+            cand.sort(key=lambda vp: c.distance(vp[1]))
+            return cand[0][0], len(set(v for v, _ in cand))
+
+        # Bề dày từng vùng
+        thick = [None]*n
+        for i in range(n):
+            dv, nd = near_val(depth_pts, regions[i], cent[i])
+            thick[i] = dv
+            if dv is not None and nd > 1:
+                log_fn(f"  ⚠ Vùng sàn #{region_no+i+1} có nhiều giá trị bề dày → "
+                       f"chọn {dv}mm (gần trọng tâm), kiểm tra lại", "warning")
+
+        # Phân loại biên: SOFFIT (cùng TOC) / STEP (khác TOC)
+        soffadj = [[] for _ in range(n)]
+        stepadj = [dict() for _ in range(n)]
+        for i in range(n):
+            for j in range(i+1, n):
+                sh = regions[i].boundary.intersection(regions[j].boundary)
+                if sh.is_empty or sh.length < 0.05:
+                    continue
+                mid = sh.interpolate(sh.length/2)
+                dso = min((so.distance(mid) for so in rsoff), default=9e9)
+                dst = min((st.distance(mid) for st in rstep), default=9e9)
+                if dso < 0.06 and dso <= dst:
+                    soffadj[i].append(j); soffadj[j].append(i)
+                elif dst < 0.20:
+                    stepadj[i][j] = sh; stepadj[j][i] = sh
+
+        # Anchor S.F.L (nếu có)
+        toc_anchor = [None]*n
+        if datum_sfl is not None:
+            for i in range(n):
+                sv, _ = near_val(sfl_pts, regions[i], cent[i])
+                if sv is not None:
+                    toc_anchor[i] = int(round((sv - datum_sfl) * 1000))
+
+        # Bước nhảy: số ở vùng THẤP; vùng cao = step-neighbor gần text nhất
+        jumps = []
+        for val, p in step_pts:
+            li = next((i for i in range(n) if regions[i].contains(p)), None)
+            if li is None or not stepadj[li]:
+                continue
+            hj = min(stepadj[li], key=lambda j: stepadj[li][j].distance(p))
+            jumps.append((li, hj, val))
+
+        # Đồ thị delta: rel[v] = rel[u] + delta
+        graph = [[] for _ in range(n)]
+        for i in range(n):
+            for j in soffadj[i]:
+                graph[i].append((j, 0))
+        for li, hj, val in jumps:
+            graph[li].append((hj, +val))   # rel[lower] = rel[higher] - val
+            graph[hj].append((li, -val))
+
+        rel = [None]*n
+        for start in range(n):
+            if rel[start] is not None:
+                continue
+            rel[start] = toc_anchor[start] if toc_anchor[start] is not None else 0
+            stack = [start]
+            while stack:
+                u = stack.pop()
+                for v, dlt in graph[u]:
+                    if rel[v] is None:
+                        rel[v] = rel[u] + dlt
+                        stack.append(v)
+        if datum_sfl is None and any(r is not None for r in rel):
+            mx = max(r for r in rel if r is not None)
+            rel = [None if r is None else r - mx for r in rel]
+        toc = rel
+
+        # Kiểm tra chéo S.F.L vs step-jump
+        if datum_sfl is not None:
+            for i in range(n):
+                sv, _ = near_val(sfl_pts, regions[i], cent[i])
+                if sv is not None and toc[i] is not None:
+                    expect = int(round((sv - datum_sfl)*1000))
+                    if toc[i] != expect:
+                        log_fn(f"  ⚠ Vùng #{region_no+i+1}: S.F.L→TOC={expect} nhưng "
+                               f"step-jump→{toc[i]} — kiểm tra chéo", "warning")
+        for li, hj, val in jumps:
+            if toc[li] is not None and toc[hj] is not None \
+                    and abs((toc[hj]-toc[li]) - val) > 1:
+                log_fn(f"  ⚠ Bước nhảy {val}mm không khớp cao độ tính được "
+                       f"({toc[hj]-toc[li]}mm) — kiểm tra", "warning")
+
+        # Kế thừa khi thiếu
+        fulladj = [[] for _ in range(n)]
+        for i in range(n):
+            for j in range(i+1, n):
+                sh = regions[i].boundary.intersection(regions[j].boundary)
+                if not sh.is_empty and sh.length >= 0.05:
+                    fulladj[i].append(j); fulladj[j].append(i)
+        for i in range(n):
+            if thick[i] is None:
+                inh = next((thick[j] for j in fulladj[i] if thick[j] is not None), None)
+                thick[i] = inh if inh is not None else base_t
+                log_fn(f"  ⚠ Vùng sàn #{region_no+i+1} thiếu bề dày → "
+                       f"{'kế thừa' if inh else 'mặc định'} {thick[i]}mm", "warning")
+            if toc[i] is None:
+                toc[i] = base_toc
+                log_fn(f"  ⚠ Vùng sàn #{region_no+i+1} thiếu cao độ → TOC={base_toc}mm",
+                       "warning")
+
+        # Priority theo độ LỒNG: vùng nằm TRONG vùng khác (đảo soffit/step kín).
+        # Khi xuất ta lấp lỗ (chỉ giữ exterior) nên vùng ngoài ĐÈ lên vùng trong
+        # -> vùng trong phải priority CAO hơn để thắng trong RAM Concept.
+        filled = [Polygon(g.exterior) for g in regions]
+        prio = [base_pr]*n
+        for i in range(n):
+            depth = 0
+            for j in range(n):
+                if j != i and filled[j].area > regions[i].area * 1.001 \
+                        and filled[j].contains(cent[i]):
+                    depth += 1
+            prio[i] = base_pr + depth
+
+        for i, g in enumerate(regions):
+            ring = list(g.exterior.coords)[:-1]
+            out_slabs.append({"pts": ring, "thickness": thick[i],
+                              "toc": toc[i], "priority": prio[i]})
+            if n > 1:
+                log_fn(f"  ✓ Vùng sàn #{region_no+i+1}: {g.area:.1f} m² → "
+                       f"dày {thick[i]}mm, TOC {toc[i]:+d}mm, Priority={prio[i]}",
+                       "success")
+        region_no += n
+
+    return out_slabs
+
+
 def run_conversion(config: dict, log_fn) -> bool:
     dxf_file     = config["dxf_file"]
     cpt_template = config["cpt_template"]
@@ -1124,7 +1416,8 @@ def run_conversion(config: dict, log_fn) -> bool:
             return (s1[0] + t*ux, s1[1] + t*uy)
 
         # Tách vách dọc và ngang
-        vert_walls = [(e[0], e[1]) for e in walls if is_vertical(e[0], e[1])]
+        vert_walls = [(e[0], e[1], (e[2] if len(e) > 2 else None))
+                      for e in walls if is_vertical(e[0], e[1])]
 
         result = []
         for entry in walls:
@@ -1141,8 +1434,11 @@ def run_conversion(config: dict, log_fn) -> bool:
             best1, best2 = snap_dist, snap_dist
 
             L_orig = _m.hypot(p2[0]-p1[0], p2[1]-p1[1])
-            for v1, v2 in vert_walls:
-                snp = snap_pt_onto_seg(p1, v1, v2, snap_dist)
+            for v1, v2, vth in vert_walls:
+                # CHỈ snap khe NHỎ = mối nối thật (~nửa bề dày vách dọc), KHÔNG
+                # kéo đầu vách qua LỖ CỬA lớn -> tránh "kéo thừa ra ngoài".
+                cap = max(0.25, (vth / 2 + 0.10) if vth else 0.0)
+                snp = snap_pt_onto_seg(p1, v1, v2, cap)
                 if snp:
                     # CHỈ snap khi KHÔNG làm NGẮN vách: vách dọc cắt ngang ở GIỮA
                     # (vách ngang xuyên qua) -> đầu này là MÚT thật, không kéo lùi.
@@ -1152,7 +1448,7 @@ def run_conversion(config: dict, log_fn) -> bool:
                         if d < best1:
                             best1, new_p1 = d, snp
 
-                snp = snap_pt_onto_seg(p2, v1, v2, snap_dist)
+                snp = snap_pt_onto_seg(p2, v1, v2, cap)
                 if snp:
                     if _m.hypot(snp[0]-p1[0], snp[1]-p1[1]) >= L_orig - 0.02:
                         d = _m.hypot(p2[0]-snp[0], p2[1]-snp[1])
@@ -1303,6 +1599,16 @@ def run_conversion(config: dict, log_fn) -> bool:
         data["walls"].extend(data["walls_curved"])
         log_fn(f"  Curved walls: added {len(data['walls_curved'])} centerline "
                f"segments (no merge/snap)", "info")
+
+    # ── Tự dò bề dày + cao độ sàn theo STEP / SOFFIT STEP ──────
+    if config.get("detect_slab_depth") and data["slabs"]:
+        before = len(data["slabs"])
+        log_fn("\n  → Detect slab depth & TOC by STEP / SOFFIT STEP...", "info")
+        data["slabs"] = subdivide_slabs_by_depth(
+            data["slabs"], msp, unit_scale,
+            config.get("slab_depth_layers", {}), log_fn)
+        log_fn(f"  Slab regions: {before} → {len(data['slabs'])} "
+               f"(per-region thickness/TOC)", "info")
 
     # ── RAM Concept ────────────────────────────────────────────
     log_fn("\nSTEP 2 — CONNECT RAM CONCEPT API", "title")
@@ -2205,6 +2511,15 @@ class App(tk.Tk):
         self.v_sseg = self._spin_row(f, "Curved slab edge seg (m)", 3, 0.20, 5.00, 0.10, 0.80)
         self.v_wseg = self._spin_row(f, "Curved wall seg (m)",     4, 0.20, 5.00, 0.10, 0.80)
 
+        # Tự dò bề dày + cao độ sàn theo nét STEP / SOFFIT STEP + SLAB_DEPTH + S.F.L
+        self.v_detect_depth = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            f, text="Auto-detect slab depth & TOC (STEP / SOFFIT STEP)",
+            variable=self.v_detect_depth, bg=BG_PANEL, fg=TEXT_SEC,
+            selectcolor=BG_CARD, activebackground=BG_PANEL,
+            activeforeground=TEXT_PRI, font=FONT_SMALL, anchor="w",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
+
     # ── Browse / Layer ────────────────────────────────────────
     def _browse_dxf(self, var, *_):
         path = filedialog.askopenfilename(
@@ -2379,6 +2694,13 @@ class App(tk.Tk):
             "slab_seg":     self.v_sseg.get(),   # edges tối thiểu khi làm phẳng biên sàn cong
             "wall_seg":     self.v_wseg.get(),   # day cung toi thieu khi chia vach cong
             "layer_map":    self._layer_map,
+            "detect_slab_depth": bool(self.v_detect_depth.get()),
+            "slab_depth_layers": {                # tên layer nguồn (chuẩn PTX)
+                "step":   "STEP",
+                "soffit": "SOFFIT STEP",
+                "depth":  "SLAB_DEPTH",
+                "sfl":    "STRUCTURAL FINISH FLOOR",
+            },
         }
 
         self._clear_log()
