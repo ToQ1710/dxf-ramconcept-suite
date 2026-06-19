@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('dxf_to_ramconcept.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(cd /d \"D:\\\\combined\")",
+      "Bash(python -m PyInstaller DXF_RAMConcept_Suite.spec --noconfirm)",
+      "Bash(git -C \"D:/combined\" init)",
+      "Bash(git -C \"D:/combined\" config user.name)",
+      "Bash(git -C \"D:/combined\" config user.email)",
+      "Bash(git -C \"D:/combined\" config user.email \"quangtoantung@gmail.com\")",
+      "Bash(git -C \"D:/combined\" config user.name \"quangtoantung\")",
+      "Bash(git -C \"D:/combined\" add .)",
+      "Bash(git -C \"D:/combined\" status --short)"
+    ]
+  }
+}
