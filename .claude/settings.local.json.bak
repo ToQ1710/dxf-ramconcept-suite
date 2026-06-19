@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git pull *)",
+      "Bash(echo \"---exit: $?\")",
+      "Bash(git clone *)",
+      "Bash(git init *)",
+      "Bash(git remote *)",
+      "Bash(git fetch *)",
+      "Bash(git checkout *)",
+      "Bash(cp .claude/settings.local.json .claude/settings.local.json.bak 2>&1 && git checkout -b main --track origin/main -f 2>&1; echo \"---exit: $?\")"
+    ]
+  }
+}

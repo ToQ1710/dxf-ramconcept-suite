@@ -531,13 +531,40 @@ def run_conversion(config: dict, log_fn) -> bool:
         for p in outpts[1:]:
             if _mm.hypot(p[0]-cleaned[-1][0], p[1]-cleaned[-1][1]) > 0.001:
                 cleaned.append(p)
-        # Kéo dài đoạn ĐẦU/CUỐI thêm ~½ bề dày để CHẠM MÚT vách (medial vốn ngắn hơn ½ bề dày)
+        # Kéo dài 2 đầu medial tới ĐÚNG mút vách.
+        # Phép ghép điểm đối diện (offset 15%-85% chu vi) KHÔNG bắt được cặp mặt
+        # ngang qua end-cap ở đầu tự do -> tim bị CẮT CỤT ~0.075*chu_vi mỗi đầu
+        # (vd vách L này mất ~1.6m mỗi đầu). Snap đầu tim vào GIỮA cạnh end-cap.
         if len(cleaned) >= 2:
+            # cạnh outline dài ≈ bề dày = end-cap (mặt bịt đầu nối 2 mặt vách)
+            caps = []
+            for i in range(cnt):
+                cx1, cy1, _bb = verts[i]
+                cj = (i + 1) % n
+                cx2, cy2 = verts[cj][0], verts[cj][1]
+                Lc = _mm.hypot(cx2 - cx1, cy2 - cy1)
+                if 0.6 * thick <= Lc <= 1.5 * thick:
+                    caps.append(((cx1 + cx2) / 2, (cy1 + cy2) / 2))
+
             def _ext(a, b):
-                L = _mm.hypot(a[0]-b[0], a[1]-b[1])
+                """Snap đầu 'a' (tiếp theo là 'b' phía trong) vào end-cap nằm đúng
+                hướng tangent đi ra ngoài; nếu không có cap thì nới ~½ bề dày."""
+                dx, dy = a[0] - b[0], a[1] - b[1]
+                L = _mm.hypot(dx, dy)
                 if L < 1e-9:
                     return a
-                return (a[0] + (a[0]-b[0])/L * thick/2, a[1] + (a[1]-b[1])/L * thick/2)
+                ux, uy = dx / L, dy / L
+                best = None; bestd = 1e18
+                for cm in caps:
+                    vx, vy = cm[0] - a[0], cm[1] - a[1]
+                    # cap phải ở phía NGOÀI (cùng hướng tangent) & gần như thẳng hàng
+                    if vx * ux + vy * uy > 0 and abs(vx * uy - vy * ux) <= thick:
+                        d = _mm.hypot(vx, vy)
+                        if d < bestd:
+                            bestd = d; best = cm
+                if best is not None:
+                    return best
+                return (a[0] + ux * thick / 2, a[1] + uy * thick / 2)
             cleaned[0] = _ext(cleaned[0], cleaned[1])
             cleaned[-1] = _ext(cleaned[-1], cleaned[-2])
         return [(cleaned[i], cleaned[i+1], thick) for i in range(len(cleaned)-1)]
@@ -783,19 +810,26 @@ def run_conversion(config: dict, log_fn) -> bool:
             return min(L, hi) - max(0.0, lo)
 
         def centerline(a1, a2, b1, b2):
-            """Tim của 2 đoạn song song: align b theo chiều a, rồi trung bình."""
+            """Tim của 2 đoạn song song.
+            Tim NẰM GIỮA 2 mặt (về pháp tuyến) và TRẢI HẾT phần chung+riêng của
+            2 mặt (UNION theo trục dọc). Tránh cắt cụt khi 1 mặt bị NGẮT bởi vách
+            vuông góc tại T-junction: mặt 'xuyên' còn nguyên -> tim phải dài hết
+            theo mặt dài, không bị kéo về theo mặt ngắn."""
             dx, dy = a2[0]-a1[0], a2[1]-a1[1]
             L = _m.hypot(dx, dy)
             if L < 1e-9:
                 return (((a1[0]+b1[0])/2, (a1[1]+b1[1])/2),
                         ((a2[0]+b2[0])/2, (a2[1]+b2[1])/2))
             ux, uy = dx/L, dy/L
-            # Nếu b hướng ngược lại, lật b
-            dot = (b2[0]-b1[0])*ux + (b2[1]-b1[1])*uy
-            if dot < 0:
-                b1, b2 = b2, b1
-            return (((a1[0]+b1[0])/2, (a1[1]+b1[1])/2),
-                    ((a2[0]+b2[0])/2, (a2[1]+b2[1])/2))
+            # Điểm tựa = trung điểm 2 trung điểm mặt -> luôn cách đều 2 mặt (½ bề dày)
+            mA = ((a1[0]+a2[0])/2, (a1[1]+a2[1])/2)
+            mB = ((b1[0]+b2[0])/2, (b1[1]+b2[1])/2)
+            base = ((mA[0]+mB[0])/2, (mA[1]+mB[1])/2)
+            # Trải hết theo trục dọc: union hình chiếu của cả 4 đầu mặt
+            ts = [(p[0]-base[0])*ux + (p[1]-base[1])*uy for p in (a1, a2, b1, b2)]
+            t0, t1 = min(ts), max(ts)
+            return ((base[0]+ux*t0, base[1]+uy*t0),
+                    (base[0]+ux*t1, base[1]+uy*t1))
 
         def stitch_collinear(segs, gap_tol=0.35):
             """Nối các đoạn COLLINEAR (mặt wall bị chia bởi vertex lỗ cửa hoặc bị
@@ -1106,18 +1140,24 @@ def run_conversion(config: dict, log_fn) -> bool:
             new_p1, new_p2 = p1, p2
             best1, best2 = snap_dist, snap_dist
 
+            L_orig = _m.hypot(p2[0]-p1[0], p2[1]-p1[1])
             for v1, v2 in vert_walls:
                 snp = snap_pt_onto_seg(p1, v1, v2, snap_dist)
                 if snp:
-                    d = _m.hypot(p1[0]-snp[0], p1[1]-snp[1])
-                    if d < best1:
-                        best1, new_p1 = d, snp
+                    # CHỈ snap khi KHÔNG làm NGẮN vách: vách dọc cắt ngang ở GIỮA
+                    # (vách ngang xuyên qua) -> đầu này là MÚT thật, không kéo lùi.
+                    # Cho phép khi snap GIỮ NGUYÊN/NỚI DÀI (đầu lỏng -> chạm tim dọc).
+                    if _m.hypot(snp[0]-p2[0], snp[1]-p2[1]) >= L_orig - 0.02:
+                        d = _m.hypot(p1[0]-snp[0], p1[1]-snp[1])
+                        if d < best1:
+                            best1, new_p1 = d, snp
 
                 snp = snap_pt_onto_seg(p2, v1, v2, snap_dist)
                 if snp:
-                    d = _m.hypot(p2[0]-snp[0], p2[1]-snp[1])
-                    if d < best2:
-                        best2, new_p2 = d, snp
+                    if _m.hypot(snp[0]-p1[0], snp[1]-p1[1]) >= L_orig - 0.02:
+                        d = _m.hypot(p2[0]-snp[0], p2[1]-snp[1])
+                        if d < best2:
+                            best2, new_p2 = d, snp
 
             # Nếu sau snap 2 đầu trùng nhau → bỏ snap (giữ nguyên original)
             snapped_len = _m.hypot(new_p2[0]-new_p1[0], new_p2[1]-new_p1[1])
