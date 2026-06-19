@@ -180,7 +180,7 @@ def _clean_polygon(pts, dup_tol=0.002, col_tol=0.001):
     return out if len(out) >= 3 else None
 
 
-def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn):
+def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.8):
     """Chia mỗi tấm sàn thành nhiều VÙNG theo nét STEP / SOFFIT STEP, rồi gán
     bề dày (SLAB_DEPTH) và cao độ TOC cho từng vùng.
 
@@ -210,18 +210,67 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn):
     def q(layer, etype):
         return msp.query('%s[layer=="%s"]' % (etype, layer))
 
-    def _ring(e):
-        pts = [(p[0]*s, p[1]*s) for p in e.get_points("xy")]
-        if getattr(e, "is_closed", False) and pts and pts[0] != pts[-1]:
-            pts.append(pts[0])           # đóng vòng cho polyline kín (vd ô soffit)
-        return pts
+    try:
+        from ezdxf.math import bulge_to_arc as _b2a
+    except Exception:
+        _b2a = None
+
+    def _flatten_poly(e):
+        """LWPOLYLINE → điểm (m); CUNG CONG (bulge) chia thành đoạn thẳng theo
+        LƯỚI ANGLE TOÀN CỤC (_arc_grid_points) — giống xử lý SLAB EDGE — để cung
+        là biên chung của 2 vùng LUÔN TRÙNG node."""
+        raw = list(e.get_points("xyb"))
+        n = len(raw)
+        if n < 2:
+            return [(p[0]*s, p[1]*s) for p in raw]
+        closed = bool(getattr(e, "is_closed", False))
+        out = []
+        cnt = n if closed else n - 1
+        for i in range(cnt):
+            x1, y1, b = raw[i][0]*s, raw[i][1]*s, raw[i][2]
+            x2, y2 = raw[(i+1) % n][0]*s, raw[(i+1) % n][1]*s
+            out.append((x1, y1))
+            if abs(b) > 1e-6 and _b2a is not None:
+                try:
+                    center, _a0, _a1, R = _b2a((x1, y1), (x2, y2), b)
+                    theta = 4.0 * _m.atan(b)            # angle cung có dấu
+                    if R > 1e-9:
+                        a_start = _m.atan2(y1 - center.y, x1 - center.x)
+                        for ip in _arc_grid_points(center.x, center.y, R,
+                                                   a_start, theta, slab_seg):
+                            out.append(ip)
+                except Exception:
+                    pass
+        out.append((raw[0][0]*s, raw[0][1]*s) if closed
+                   else (raw[-1][0]*s, raw[-1][1]*s))
+        return out
+
+    def _circle_ring(cx, cy, r):
+        ring = _arc_grid_points(cx, cy, r, 0.0, 2*_m.pi, slab_seg)
+        if len(ring) < 3:
+            ring = [(cx + r*_m.cos(2*_m.pi*k/12),
+                     cy + r*_m.sin(2*_m.pi*k/12)) for k in range(12)]
+        ring.append(ring[0])               # đóng vòng → tạo vùng tròn
+        return ring
 
     def collect_lines(layer):
         out = []
         for e in q(layer, "LWPOLYLINE"):
-            pts = _ring(e)
+            pts = _flatten_poly(e)
             if len(pts) >= 2:
                 out.append(LineString(pts))
+        for e in q(layer, "ARC"):          # cung tròn rời
+            cx, cy, r = e.dxf.center.x*s, e.dxf.center.y*s, e.dxf.radius*s
+            a0 = _m.radians(e.dxf.start_angle)
+            theta = (_m.radians(e.dxf.end_angle) - a0) % (2*_m.pi)
+            pts = [(cx + r*_m.cos(a0), cy + r*_m.sin(a0))]
+            pts += _arc_grid_points(cx, cy, r, a0, theta, slab_seg)
+            pts.append((cx + r*_m.cos(a0+theta), cy + r*_m.sin(a0+theta)))
+            if len(pts) >= 2:
+                out.append(LineString(pts))
+        for e in q(layer, "CIRCLE"):       # đường tròn → vòng kín → vùng tròn
+            out.append(LineString(_circle_ring(
+                e.dxf.center.x*s, e.dxf.center.y*s, e.dxf.radius*s)))
         return out
 
     step_l  = layers.get("step",   "STEP")
@@ -1606,7 +1655,7 @@ def run_conversion(config: dict, log_fn) -> bool:
         log_fn("\n  → Detect slab depth & TOC by STEP / SOFFIT STEP...", "info")
         data["slabs"] = subdivide_slabs_by_depth(
             data["slabs"], msp, unit_scale,
-            config.get("slab_depth_layers", {}), log_fn)
+            config.get("slab_depth_layers", {}), log_fn, slab_seg)
         log_fn(f"  Slab regions: {before} → {len(data['slabs'])} "
                f"(per-region thickness/TOC)", "info")
 
