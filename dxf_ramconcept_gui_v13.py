@@ -388,6 +388,44 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 pts[idx] = (x0 - (x1-x0)/L*ext, y0 - (y1-y0)/L*ext)
         return LineString(pts)
 
+    def _band_connectors(rstep, rsoff, boundary, band_max=1.5):
+        """Ghép cặp nét STEP // SOFFIT (song song, gần nhau = 1 dải drop panel)
+        rồi NỐI 2 cặp đầu mút tương ứng để KHÉP dải hở → polygonize tạo được
+        vùng panel. Chỉ nối đầu mút TỰ DO (không nằm trên biên sàn)."""
+        conns = []
+
+        def free(pt):                      # đầu mút chưa chạm biên
+            return boundary.distance(Point(pt)) > 0.3
+
+        for S in rstep:
+            cs = list(S.coords)
+            s0, s1 = cs[0], cs[-1]
+            best, bestcost = None, band_max * 2
+            for F in rsoff:
+                if S.intersects(F):
+                    continue               # cắt nhau → không phải dải
+                gap = S.distance(F)
+                if gap < 0.03 or gap > band_max:
+                    continue               # trùng / quá xa → bỏ
+                cf = list(F.coords)
+                f0, f1 = cf[0], cf[-1]
+                da = _d(s0, f0) + _d(s1, f1)
+                dc = _d(s0, f1) + _d(s1, f0)
+                pairs = ((s0, f0), (s1, f1)) if da <= dc else ((s0, f1), (s1, f0))
+                l0, l1 = _d(*pairs[0]), _d(*pairs[1])
+                lim = gap * 1.5 + 0.10     # connector ≈ KHE (khép vuông góc), không chéo dài
+                # 2 đầu phải khép gọn & tương đương nhau (dải song song thật)
+                if max(l0, l1) > lim or abs(l0 - l1) > gap * 0.8 + 0.10:
+                    continue
+                cost = min(da, dc)
+                if cost < bestcost:
+                    bestcost, best = cost, pairs
+            if best:
+                for a, b in best:
+                    if _d(a, b) > 0.02 and (free(a) or free(b)):
+                        conns.append(LineString([a, b]))
+        return conns
+
     out_slabs = []
     region_no = 0
     for sd in slabs:
@@ -408,6 +446,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         rstep = [l for l in steps if l.intersects(poly)]
         rsoff = [l for l in soffs if l.intersects(poly)]
         cut = [snap_ends(l, poly.boundary) for l in rstep + rsoff]
+        cut += _band_connectors(rstep, rsoff, poly.boundary)   # khép dải step//soffit
         if cut:
             merged = unary_union([poly.boundary] + cut)
             regions = [g for g in polygonize(merged)
