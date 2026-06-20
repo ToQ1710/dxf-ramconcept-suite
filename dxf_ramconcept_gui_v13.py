@@ -417,38 +417,86 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 pts[idx] = (x0 - (x1-x0)/L*ext, y0 - (y1-y0)/L*ext)
         return LineString(pts)
 
-    def _band_connectors(rstep, rsoff, boundary, band_max=1.5):
-        """Ghép cặp nét STEP // SOFFIT (song song, gần nhau = 1 dải drop panel)
-        rồi NỐI 2 cặp đầu mút tương ứng để KHÉP dải hở → polygonize tạo được
-        vùng panel. Chỉ nối đầu mút TỰ DO (không nằm trên biên sàn)."""
+    def _band_connectors(rstep, rsoff, boundary, near_pts=None, band_max=1.2):
+        """Khép dải drop panel giữa ĐOẠN nét STEP và ĐOẠN nét SOFFIT song song
+        gần nhau (cấp ĐOẠN — bắt được cả pocket hcn/L). Nối đầu đoạn vào CHÂN
+        VUÔNG GÓC trên đoạn song song. CHỈ khép quanh 'near_pts' (đích leader =
+        circle, đánh dấu panel) để KHÔNG cắt vụn field/strip thường."""
         conns = []
+        near = near_pts or []
 
-        def free(pt):                      # đầu mút chưa chạm biên
+        def near_panel(pt):
+            return any(_d(pt, q) < 1.6 for q in near)
+
+        def segments(lines):
+            out = []
+            for L in lines:
+                cs = list(L.coords)
+                for i in range(len(cs) - 1):
+                    if _d(cs[i], cs[i+1]) > 0.05:
+                        out.append((cs[i], cs[i+1]))
+            return out
+
+        ssegs, fsegs = segments(rstep), segments(rsoff)
+
+        def parallel(s, f):
+            a1 = _m.atan2(s[1][1]-s[0][1], s[1][0]-s[0][0])
+            a2 = _m.atan2(f[1][1]-f[0][1], f[1][0]-f[0][0])
+            dd = abs(a1 - a2) % _m.pi
+            return dd < _m.radians(12) or (_m.pi - dd) < _m.radians(12)
+
+        def foot(p, a, b):                  # chân vuông góc của p trên đoạn a-b
+            dx, dy = b[0]-a[0], b[1]-a[1]
+            L2 = dx*dx + dy*dy
+            if L2 < 1e-9:
+                return None
+            t = ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / L2
+            if t < 0.02 or t > 0.98:        # chân phải nằm TRONG đoạn (gối lên nhau)
+                return None
+            return (a[0]+t*dx, a[1]+t*dy)
+
+        def free(pt):                      # đầu đoạn chưa chạm biên sàn
             return boundary.distance(Point(pt)) > 0.3
 
+        def close_to(aSegs, bSegs):
+            for A in aSegs:
+                for B in bSegs:
+                    if not parallel(A, B):
+                        continue
+                    for ep in (A[0], A[1]):
+                        if not free(ep):   # đầu trên biên đã tự khép → không nối
+                            continue
+                        fo = foot(ep, B[0], B[1])
+                        if fo is None:
+                            continue
+                        g = _d(ep, fo)
+                        mid = ((ep[0]+fo[0])/2, (ep[1]+fo[1])/2)
+                        if 0.05 < g < band_max and near_panel(mid):
+                            conns.append(LineString([ep, fo]))
+
+        close_to(ssegs, fsegs)             # đầu đoạn step -> đoạn soffit
+        close_to(fsegs, ssegs)             # đầu đoạn soffit -> đoạn step
+
+        # Whole-polyline: khép dải DÀI bằng cách nối 2 cặp ĐẦU MÚT polyline tương
+        # ứng (cho dải song song trải dài, chỗ khép xa circle). An toàn: chỉ khi
+        # 2 connector ≈ khe & tương đương nhau.
         for S in rstep:
-            cs = list(S.coords)
-            s0, s1 = cs[0], cs[-1]
-            best, bestcost = None, band_max * 2
+            cs = list(S.coords); s0, s1 = cs[0], cs[-1]
+            best, bestcost = None, 1.5 * 2
             for F in rsoff:
                 if S.intersects(F):
-                    continue               # cắt nhau → không phải dải
+                    continue
                 gap = S.distance(F)
-                if gap < 0.03 or gap > band_max:
-                    continue               # trùng / quá xa → bỏ
-                cf = list(F.coords)
-                f0, f1 = cf[0], cf[-1]
-                da = _d(s0, f0) + _d(s1, f1)
-                dc = _d(s0, f1) + _d(s1, f0)
+                if gap < 0.03 or gap > 1.5:
+                    continue
+                cf = list(F.coords); f0, f1 = cf[0], cf[-1]
+                da = _d(s0, f0) + _d(s1, f1); dc = _d(s0, f1) + _d(s1, f0)
                 pairs = ((s0, f0), (s1, f1)) if da <= dc else ((s0, f1), (s1, f0))
                 l0, l1 = _d(*pairs[0]), _d(*pairs[1])
-                lim = gap * 1.5 + 0.10     # connector ≈ KHE (khép vuông góc), không chéo dài
-                # 2 đầu phải khép gọn & tương đương nhau (dải song song thật)
-                if max(l0, l1) > lim or abs(l0 - l1) > gap * 0.8 + 0.10:
+                if max(l0, l1) > gap * 1.5 + 0.10 or abs(l0 - l1) > gap * 0.8 + 0.10:
                     continue
-                cost = min(da, dc)
-                if cost < bestcost:
-                    bestcost, best = cost, pairs
+                if min(da, dc) < bestcost:
+                    bestcost, best = min(da, dc), pairs
             if best:
                 for a, b in best:
                     if _d(a, b) > 0.02 and (free(a) or free(b)):
@@ -475,7 +523,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         rstep = [l for l in steps if l.intersects(poly)]
         rsoff = [l for l in soffs if l.intersects(poly)]
         cut = [snap_ends(l, poly.boundary) for l in rstep + rsoff]
-        cut += _band_connectors(rstep, rsoff, poly.boundary)   # khép dải step//soffit
+        cut += _band_connectors(rstep, rsoff, poly.boundary, circles)  # khép dải quanh circle
         if cut:
             merged = unary_union([poly.boundary] + cut)
             regions = [g for g in polygonize(merged)
