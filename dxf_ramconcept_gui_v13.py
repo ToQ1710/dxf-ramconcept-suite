@@ -180,7 +180,8 @@ def _clean_polygon(pts, dup_tol=0.002, col_tol=0.001):
     return out if len(out) >= 3 else None
 
 
-def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.8):
+def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.8,
+                             setdown_default=30):
     """Chia mỗi tấm sàn thành nhiều VÙNG theo nét STEP / SOFFIT STEP, rồi gán
     bề dày (SLAB_DEPTH) và cao độ TOC cho từng vùng.
 
@@ -253,12 +254,35 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         ring.append(ring[0])               # đóng vòng → tạo vùng tròn
         return ring
 
+    def _dedup(pts):
+        cl = [pts[0]] if pts else []
+        for q2 in pts[1:]:
+            if _m.hypot(q2[0]-cl[-1][0], q2[1]-cl[-1][1]) > 1e-6:
+                cl.append(q2)
+        return cl
+
+    def _add_cut(out, pts, closed=False):
+        """Thêm 1 nét cắt, BỎ NHIỄU: nét quá ngắn (<0.5m) hoặc vòng kín tí hon
+        (ký hiệu hatch bậc thang / điểm trùng) → không tạo vùng rác."""
+        pts = _dedup(pts)
+        if len(pts) < 2:
+            return
+        ls = LineString(pts)
+        if ls.length < 0.5:
+            return
+        if closed:
+            xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+            if (max(xs)-min(xs) < 0.3) or (max(ys)-min(ys) < 0.3):
+                return            # vòng kín mỏng = tick hatch, bỏ
+        out.append(ls)
+
     def collect_lines(layer):
         out = []
         for e in q(layer, "LWPOLYLINE"):
-            pts = _flatten_poly(e)
-            if len(pts) >= 2:
-                out.append(LineString(pts))
+            _add_cut(out, _flatten_poly(e), bool(getattr(e, "is_closed", False)))
+        for e in q(layer, "LINE"):         # nét cắt dạng LINE
+            _add_cut(out, [(e.dxf.start.x*s, e.dxf.start.y*s),
+                           (e.dxf.end.x*s,   e.dxf.end.y*s)])
         for e in q(layer, "ARC"):          # cung tròn rời
             cx, cy, r = e.dxf.center.x*s, e.dxf.center.y*s, e.dxf.radius*s
             a0 = _m.radians(e.dxf.start_angle)
@@ -266,8 +290,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
             pts = [(cx + r*_m.cos(a0), cy + r*_m.sin(a0))]
             pts += _arc_grid_points(cx, cy, r, a0, theta, slab_seg)
             pts.append((cx + r*_m.cos(a0+theta), cy + r*_m.sin(a0+theta)))
-            if len(pts) >= 2:
-                out.append(LineString(pts))
+            _add_cut(out, pts)
         for e in q(layer, "CIRCLE"):       # đường tròn → vòng kín → vùng tròn
             out.append(LineString(_circle_ring(
                 e.dxf.center.x*s, e.dxf.center.y*s, e.dxf.radius*s)))
@@ -347,13 +370,22 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
     log_fn(f"  Slab-depth: {len(depth_pts)} callout, {len(sfl_pts)} S.F.L, "
            f"{len(step_pts)} step-jump, {len(steps)} STEP, {len(soffs)} SOFFIT", "info")
 
-    def snap_ends(ls, boundary, tol=0.25):
+    def snap_ends(ls, boundary, tol=0.3, ext=0.4):
+        """Đầu nét GẦN biên (≤tol) → chiếu đúng vào biên. Đầu TỰ DO (xa biên) →
+        nối dài 'ext' để bắc cầu khe (nét step/soffit bị ngắt bởi ký hiệu hatch
+        hoặc 2 mảnh panel rời) → polygonize khép được vùng drop panel."""
         pts = list(ls.coords)
-        for idx in (0, -1):
+        if len(pts) < 2:
+            return ls
+        for idx, nb in ((0, 1), (-1, -2)):
             p = Point(pts[idx])
             if boundary.distance(p) <= tol:
                 pr = boundary.interpolate(boundary.project(p))
                 pts[idx] = (pr.x, pr.y)
+            elif ext > 0:
+                x0, y0 = pts[idx]; x1, y1 = pts[nb]
+                L = _m.hypot(x1-x0, y1-y0) or 1.0
+                pts[idx] = (x0 - (x1-x0)/L*ext, y0 - (y1-y0)/L*ext)
         return LineString(pts)
 
     out_slabs = []
@@ -387,21 +419,38 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         n = len(regions)
         cent = [g.representative_point() for g in regions]
 
-        def near_val(pts, g, c):
+        def near_val(pts, g, c, glob=None):
+            """Giá trị callout trong vùng: ưu tiên PHỔ BIẾN NHẤT (mode) — quan
+            trọng cho sàn nền lớn có lẫn callout panel. HÒA → ưu tiên giá trị
+            phổ biến TOÀN BẢN VẼ (đáy sàn nền), rồi mới tới gần trọng tâm."""
             cand = [(v, p) for v, p in pts if g.contains(p)]
             if not cand:
                 return None, 0
-            cand.sort(key=lambda vp: c.distance(vp[1]))
-            return cand[0][0], len(set(v for v, _ in cand))
+            from collections import Counter
+            cnt = Counter(v for v, _ in cand)
+            top = max(cnt.values())
+            modes = {v for v, k in cnt.items() if k == top}
+            if len(modes) == 1:
+                pick = next(iter(modes))
+            elif glob:                  # hòa → mode toàn cục (trong các giá trị hòa)
+                pick = max(modes, key=lambda v: (glob.get(v, 0),
+                           -min(c.distance(p) for vv, p in cand if vv == v)))
+            else:
+                pick = min((vp for vp in cand if vp[0] in modes),
+                           key=lambda vp: c.distance(vp[1]))[0]
+            return pick, len(cnt)
+
+        from collections import Counter as _Ctr
+        glob_depth = _Ctr(v for v, _ in depth_pts)
 
         # Bề dày từng vùng
         thick = [None]*n
         for i in range(n):
-            dv, nd = near_val(depth_pts, regions[i], cent[i])
+            dv, nd = near_val(depth_pts, regions[i], cent[i], glob_depth)
             thick[i] = dv
             if dv is not None and nd > 1:
                 log_fn(f"  ⚠ Vùng sàn #{region_no+i+1} có nhiều giá trị bề dày → "
-                       f"chọn {dv}mm (gần trọng tâm), kiểm tra lại", "warning")
+                       f"chọn {dv}mm (phổ biến nhất), KIỂM TRA THỦ CÔNG", "warning")
 
         # Phân loại biên: SOFFIT (cùng TOC) / STEP (khác TOC)
         soffadj = [[] for _ in range(n)]
@@ -509,6 +558,8 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
             prio[i] = base_pr + depth
 
         for i, g in enumerate(regions):
+            if n > 1 and g.area < 0.3:   # bỏ mảnh vụn tí hon (rác giao điểm)
+                continue
             ring = list(g.exterior.coords)[:-1]
             out_slabs.append({"pts": ring, "thickness": thick[i],
                               "toc": toc[i], "priority": prio[i]})
@@ -517,6 +568,69 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                        f"dày {thick[i]}mm, TOC {toc[i]:+d}mm, Priority={prio[i]}",
                        "success")
         region_no += n
+
+    # ── SETDOWN: vùng HẠ cao độ cục bộ (TOC = sàn dưới nó − giá trị setdown) ──
+    sd_layer = layers.get("setdown", "SETDOWN")
+    sd_polys = []
+    for e in q(sd_layer, "LWPOLYLINE"):
+        if not getattr(e, "is_closed", False):
+            continue
+        pts = _flatten_poly(e)
+        if len(pts) >= 4:
+            try:
+                pg = Polygon(pts)
+                if pg.is_valid and pg.area > 0.01:
+                    sd_polys.append(pg)
+            except Exception:
+                pass
+    if sd_polys:
+        parents = []
+        for sd in out_slabs:
+            try:
+                pg = Polygon(sd["pts"])
+                if pg.is_valid and pg.area > 0:
+                    parents.append((pg, sd))
+            except Exception:
+                pass
+        base_def_t = (slabs[0].get("thickness", 200) if slabs else 200)
+        # Sàn-cha xét theo ƯU TIÊN giảm dần (priority cao trước, rồi diện tích nhỏ)
+        parents.sort(key=lambda ps: (-ps[1]["priority"], ps[0].area))
+
+        def _emit(geom, base_t, base_toc, base_pr):
+            polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+            cnt = 0
+            for piece in polys:
+                if piece.is_empty or piece.area < 0.01:
+                    continue
+                ring = list(piece.exterior.coords)[:-1]
+                out_slabs.append({
+                    "pts": ring,
+                    "thickness": max(50, base_t - setdown_default),  # hạ đáy giữ → dày −setdown
+                    "toc": base_toc - setdown_default,
+                    "priority": base_pr + 1})
+                cnt += 1
+            return cnt
+
+        nsd = 0
+        for poly in sd_polys:
+            remaining = poly
+            for pg, base in parents:        # cắt setdown theo TỪNG sàn-cha
+                if remaining.is_empty:
+                    break
+                try:
+                    inter = remaining.intersection(pg)
+                except Exception:
+                    continue
+                if not inter.is_empty and inter.area >= 0.01:
+                    nsd += _emit(inter, base["thickness"], base["toc"], base["priority"])
+                    try:
+                        remaining = remaining.difference(pg)
+                    except Exception:
+                        remaining = poly.difference(pg)
+            if not remaining.is_empty and remaining.area >= 0.01:   # phần ngoài mọi sàn
+                nsd += _emit(remaining, base_def_t, 0, 1)
+        log_fn(f"  Setdown: {nsd} mảnh — dày & TOC đều −{setdown_default}mm so với "
+               f"sàn dưới (tách theo vùng, priority cao hơn)", "info")
 
     return out_slabs
 
@@ -1655,7 +1769,8 @@ def run_conversion(config: dict, log_fn) -> bool:
         log_fn("\n  → Detect slab depth & TOC by STEP / SOFFIT STEP...", "info")
         data["slabs"] = subdivide_slabs_by_depth(
             data["slabs"], msp, unit_scale,
-            config.get("slab_depth_layers", {}), log_fn, slab_seg)
+            config.get("slab_depth_layers", {}), log_fn, slab_seg,
+            config.get("setdown_default", 30))
         log_fn(f"  Slab regions: {before} → {len(data['slabs'])} "
                f"(per-region thickness/TOC)", "info")
 
@@ -2745,11 +2860,13 @@ class App(tk.Tk):
             "layer_map":    self._layer_map,
             "detect_slab_depth": bool(self.v_detect_depth.get()),
             "slab_depth_layers": {                # tên layer nguồn (chuẩn PTX)
-                "step":   "STEP",
-                "soffit": "SOFFIT STEP",
-                "depth":  "SLAB_DEPTH",
-                "sfl":    "STRUCTURAL FINISH FLOOR",
+                "step":    "STEP",
+                "soffit":  "SOFFIT STEP",
+                "depth":   "SLAB_DEPTH",
+                "sfl":     "STRUCTURAL FINISH FLOOR",
+                "setdown": "SETDOWN",
             },
+            "setdown_default": 30,            # mm hạ TOC mặc định (SETDOWN U.N.O)
         }
 
         self._clear_log()
