@@ -299,7 +299,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                      (e.dxf.end.x*s,   e.dxf.end.y*s)))
     for e in q(depth_l, "LWPOLYLINE"):
         if not getattr(e, "is_closed", False):
-            pts = _ring(e)
+            pts = [(p[0]*s, p[1]*s) for p in e.get_points("xy")]
             if len(pts) >= 2:
                 segs.append((pts[0], pts[-1]))
 
