@@ -180,6 +180,35 @@ def _clean_polygon(pts, dup_tol=0.002, col_tol=0.001):
     return out if len(out) >= 3 else None
 
 
+def detect_setdown_value(doc, fallback=30):
+    """Đọc giá trị setdown từ legend 'SETDOWN <n>mm U.N.O' trong BẤT KỲ layout
+    (model + paper). Legend thường là MTEXT có mã màu, vd 'SETDOWN {\\C80;40mm} U.N.O'.
+    Trả về số mm tìm được, nếu không có thì fallback."""
+    import re
+    pat = re.compile(r'set\s*down.*?(\d+)\s*mm', re.I | re.S)
+    spaces = []
+    try:
+        spaces.append(doc.modelspace())
+    except Exception:
+        pass
+    try:
+        for name in doc.layouts.names():
+            if name.lower() != "model":
+                spaces.append(doc.layouts.get(name))
+    except Exception:
+        pass
+    for sp in spaces:
+        for e in sp.query("TEXT MTEXT"):
+            try:
+                s = e.plain_text() if e.dxftype() == "MTEXT" else e.dxf.text
+            except Exception:
+                s = getattr(e.dxf, "text", "")
+            m = pat.search(s or "")
+            if m:
+                return int(m.group(1))
+    return fallback
+
+
 def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.8,
                              setdown_default=30):
     """Chia mỗi tấm sàn thành nhiều VÙNG theo nét STEP / SOFFIT STEP, rồi gán
@@ -1806,10 +1835,12 @@ def run_conversion(config: dict, log_fn) -> bool:
     if config.get("detect_slab_depth") and data["slabs"]:
         before = len(data["slabs"])
         log_fn("\n  → Detect slab depth & TOC by STEP / SOFFIT STEP...", "info")
+        # Tự đọc giá trị setdown từ legend 'SETDOWN <n>mm U.N.O' (mọi layout)
+        sd_val = detect_setdown_value(doc, config.get("setdown_default", 30))
+        log_fn(f"  Setdown value (legend): {sd_val}mm", "info")
         data["slabs"] = subdivide_slabs_by_depth(
             data["slabs"], msp, unit_scale,
-            config.get("slab_depth_layers", {}), log_fn, slab_seg,
-            config.get("setdown_default", 30))
+            config.get("slab_depth_layers", {}), log_fn, slab_seg, sd_val)
         log_fn(f"  Slab regions: {before} → {len(data['slabs'])} "
                f"(per-region thickness/TOC)", "info")
 
