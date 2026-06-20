@@ -734,11 +734,17 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 under = next((s for s in old
                               if Polygon(s["pts"]).buffer(0).contains(c)), None) \
                         if old else None
-                utoc = under["toc"] if under else 0
                 upr  = under["priority"] if under else 1
+                # TOC: ưu tiên S.F.L NẰM TRONG panel (panel có cao độ riêng);
+                # không có thì kế thừa vùng nền bên dưới.
+                sv, _ = near_val(sfl_pts, face, c)
+                if sv is not None and datum_sfl is not None:
+                    ptoc = int(round((sv - datum_sfl) * 1000))
+                else:
+                    ptoc = under["toc"] if under else 0
                 out_slabs.append({"pts": list(face.exterior.coords)[:-1],
                                   "thickness": dv if dv is not None else base_def_t0,
-                                  "toc": utoc, "priority": upr})
+                                  "toc": ptoc, "priority": upr})
                 npn += 1
             log_fn(f"  Panel (ranh kín SLAB_PANEL): {npn} vùng — THAY THẾ vùng nền "
                    f"dưới panel (xoá trùng), bề dày theo callout", "info")
@@ -747,9 +753,12 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
     sd_layer = layers.get("setdown", "SETDOWN")
     sd_polys = []
     for e in q(sd_layer, "LWPOLYLINE"):
-        if not getattr(e, "is_closed", False):
+        # Nhận cả pseudo-closed (vẽ vòng về điểm đầu, cờ is_closed tắt)
+        if len(e.get_points("xy")) < 3:
             continue
         pts = _flatten_poly(e)
+        if pts and _m.hypot(pts[0][0]-pts[-1][0], pts[0][1]-pts[-1][1]) > 1e-6:
+            pts.append(pts[0])          # đóng vòng
         if len(pts) >= 4:
             try:
                 pg = Polygon(pts)
