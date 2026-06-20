@@ -238,7 +238,9 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
     s = unit_scale
 
     def q(layer, etype):
-        return msp.query('%s[layer=="%s"]' % (etype, layer))
+        # So tên layer KHÔNG phân biệt hoa/thường (vd 'slab_panel' = 'SLAB_PANEL')
+        lu = (layer or "").upper()
+        return [e for e in msp.query(etype) if e.dxf.layer.upper() == lu]
 
     try:
         from ezdxf.math import bulge_to_arc as _b2a
