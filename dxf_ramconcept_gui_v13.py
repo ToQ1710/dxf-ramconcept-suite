@@ -329,9 +329,25 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
     soff_l  = layers.get("soffit", "SOFFIT STEP")
     depth_l = layers.get("depth",  "SLAB_DEPTH")
     sfl_l   = layers.get("sfl",    "STRUCTURAL FINISH FLOOR")
+    panel_l = layers.get("panel",  "SLAB_PANEL")
 
     steps = collect_lines(step_l)
     soffs = collect_lines(soff_l)
+
+    # Ranh panel KÍN do người vẽ chỉ định (ưu tiên tuyệt đối, không suy từ band):
+    # mỗi polyline kín trên layer panel = đúng ranh 1 vùng (vd dải drop 300 phức tạp).
+    panel_loops = []
+    for e in q(panel_l, "LWPOLYLINE"):
+        # Nhận MỌI polyline trên layer panel: is_closed=True HOẶC pseudo-closed
+        # (vẽ vòng về điểm đầu, cờ closed tắt). Luôn đóng vòng để tạo ranh kín.
+        raw = [(p[0]*s, p[1]*s) for p in e.get_points("xy")]
+        if len(raw) < 3:
+            continue
+        pts = _flatten_poly(e)
+        if pts and _m.hypot(pts[0][0]-pts[-1][0], pts[0][1]-pts[-1][1]) > 1e-6:
+            pts.append(pts[0])          # đóng vòng
+        if len(pts) >= 4:
+            panel_loops.append(LineString(pts))
 
     def _d(a, b):
         return _m.hypot(a[0]-b[0], a[1]-b[1])
@@ -684,6 +700,48 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                        f"dày {thick[i]}mm, TOC {toc[i]:+d}mm, Priority={prio[i]}",
                        "success")
         region_no += n
+
+    # ── PANEL: ranh KÍN do người vẽ chỉ định (authoritative) → THAY THẾ vùng dưới ──
+    # Cắt BỎ phần vùng nền nằm dưới panel (xoá trùng), rồi thay bằng đúng vùng panel.
+    # Bề dày lấy từ callout SLAB_DEPTH bên trong panel; TOC kế thừa vùng bên dưới.
+    if panel_loops:
+        faces = [g for g in polygonize(unary_union(panel_loops)) if g.area > 0.05]
+        if faces:
+            panel_union = unary_union(faces)
+            base_def_t0 = (slabs[0].get("thickness", 200) if slabs else 200)
+            # 1) Lưu vùng nền (để kế thừa TOC) rồi CẮT BỎ phần dưới panel
+            old = out_slabs
+            out_slabs = []
+            for sx in old:
+                try:
+                    g = Polygon(sx["pts"])
+                    if not g.is_valid:
+                        g = g.buffer(0)
+                except Exception:
+                    out_slabs.append(sx); continue
+                diff = g.difference(panel_union)
+                if diff.is_empty or diff.area < 0.3:
+                    continue                     # toàn bộ nằm dưới panel → xoá
+                for piece in (diff.geoms if diff.geom_type == "MultiPolygon" else [diff]):
+                    if piece.area >= 0.3:
+                        nd = dict(sx); nd["pts"] = list(piece.exterior.coords)[:-1]
+                        out_slabs.append(nd)
+            # 2) Thêm đúng vùng panel (thay cho phần đã xoá)
+            npn = 0
+            for face in faces:
+                c = face.representative_point()
+                dv, _nd = near_val(depth_pts, face, c)
+                under = next((s for s in old
+                              if Polygon(s["pts"]).buffer(0).contains(c)), None) \
+                        if old else None
+                utoc = under["toc"] if under else 0
+                upr  = under["priority"] if under else 1
+                out_slabs.append({"pts": list(face.exterior.coords)[:-1],
+                                  "thickness": dv if dv is not None else base_def_t0,
+                                  "toc": utoc, "priority": upr})
+                npn += 1
+            log_fn(f"  Panel (ranh kín SLAB_PANEL): {npn} vùng — THAY THẾ vùng nền "
+                   f"dưới panel (xoá trùng), bề dày theo callout", "info")
 
     # ── SETDOWN: vùng HẠ cao độ cục bộ (TOC = sàn dưới nó − giá trị setdown) ──
     sd_layer = layers.get("setdown", "SETDOWN")
@@ -2983,6 +3041,7 @@ class App(tk.Tk):
                 "depth":   "SLAB_DEPTH",
                 "sfl":     "STRUCTURAL FINISH FLOOR",
                 "setdown": "SETDOWN",
+                "panel":   "SLAB_PANEL",
             },
             "setdown_default": 30,            # mm hạ TOC mặc định (SETDOWN U.N.O)
         }
