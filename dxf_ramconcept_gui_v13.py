@@ -374,6 +374,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 segs.append((pts[0], pts[-1]))
 
     depth_pts = []
+    circle_callouts = []                  # (value, Point) chỉ những callout CÓ leader→circle
     used = set()
     for c in circles:
         leader = None
@@ -388,6 +389,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
             ti = min(range(len(dtexts)), key=lambda i: _d(dtexts[i][1], far))
             if _d(dtexts[ti][1], far) <= 2.0:
                 depth_pts.append((dtexts[ti][0], Point(c)))
+                circle_callouts.append((dtexts[ti][0], Point(c)))
                 used.add(ti)
     for i, (v, tp) in enumerate(dtexts):
         if i not in used:                # text không có leader -> dùng chính vị trí
@@ -702,6 +704,62 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                        f"dày {thick[i]}mm, TOC {toc[i]:+d}mm, Priority={prio[i]}",
                        "success")
         region_no += n
+
+    # ── (2)+(3) Leader-circle authoritative: TỰ KHÉP drop panel hoặc CẢNH BÁO ──
+    # Khi callout có leader→circle nhưng giá trị KHÁC bề dày vùng nền chứa nó
+    # (drop panel chưa tách): thử khép panel từ nét step/soffit gần đó (nới cục bộ).
+    # Khép được → tạo panel + cắt vùng nền; không khép được → cảnh báo đúng toạ độ.
+    def _extend_ls(ls, d):
+        pts = list(ls.coords)
+        if len(pts) < 2:
+            return ls
+        x0, y0 = pts[0]; x1, y1 = pts[1]; L = _m.hypot(x1-x0, y1-y0) or 1.0
+        pts[0] = (x0-(x1-x0)/L*d, y0-(y1-y0)/L*d)
+        x0, y0 = pts[-1]; x1, y1 = pts[-2]; L = _m.hypot(x1-x0, y1-y0) or 1.0
+        pts[-1] = (x0-(x1-x0)/L*d, y0-(y1-y0)/L*d)
+        return LineString(pts)
+
+    for v, P in circle_callouts:
+        hi = next((i for i, sd in enumerate(out_slabs)
+                   if sd.get("priority", 1) < 2 and len(sd["pts"]) >= 3
+                   and Polygon(sd["pts"]).buffer(0).contains(P)), None)
+        if hi is None or out_slabs[hi]["thickness"] == v:
+            continue
+        host = Polygon(out_slabs[hi]["pts"]).buffer(0)
+        near = [l for l in (steps + soffs)
+                if l.distance(P) < 5.0 and l.intersects(host)]
+        carved = None
+        if near:
+            cuts = [_extend_ls(l, 1.5) for l in near]
+            try:
+                faces = [g for g in polygonize(unary_union([host.boundary] + cuts))
+                         if host.buffer(-0.01).contains(g.representative_point())]
+            except Exception:
+                faces = []
+            # panel thật phải ĐỦ LỚN & không phải sliver (khe step-soffit ~0.2m)
+            cand = [g for g in faces if g.contains(P) and 1.0 < g.area < 0.85*host.area
+                    and min(g.bounds[2]-g.bounds[0], g.bounds[3]-g.bounds[1]) > 0.5]
+            if cand:
+                carved = min(cand, key=lambda g: g.area)
+        if carved is not None:
+            base = dict(out_slabs[hi])
+            out_slabs.pop(hi)
+            rest = host.difference(carved)
+            for piece in (rest.geoms if rest.geom_type == "MultiPolygon" else [rest]):
+                if not piece.is_empty and piece.area >= 0.3:
+                    nd = dict(base); nd["pts"] = list(piece.exterior.coords)[:-1]
+                    out_slabs.append(nd)
+            sv, _ = near_val(sfl_pts, carved, carved.representative_point())
+            ptoc = (int(round((sv - datum_sfl) * 1000))
+                    if (sv is not None and datum_sfl is not None) else base["toc"])
+            out_slabs.append({"pts": list(carved.exterior.coords)[:-1],
+                              "thickness": v, "toc": ptoc,
+                              "priority": base.get("priority", 1)})
+            log_fn(f"  ✓ Auto-khép drop panel {v}mm quanh leader ({P.x:.1f},{P.y:.1f}) "
+                   f"— {carved.area:.1f} m²", "success")
+        else:
+            log_fn(f"  ⚠ Drop panel {v}mm tại ({P.x:.1f},{P.y:.1f}) KHÔNG tự khép được "
+                   f"(ranh hở) → vẽ STEP/SOFFIT khép HOẶC SLAB_PANEL tại đó", "warning")
 
     # ── PANEL: ranh KÍN do người vẽ chỉ định (authoritative) → THAY THẾ vùng dưới ──
     # Cắt BỎ phần vùng nền nằm dưới panel (xoá trùng), rồi thay bằng đúng vùng panel.
