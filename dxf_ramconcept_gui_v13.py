@@ -209,8 +209,83 @@ def detect_setdown_value(doc, fallback=30):
     return fallback
 
 
+def detect_setdown_legend(doc, fallback=30):
+    """Đọc legend setdown → (default_mm, pattern2val).
+    Hỗ trợ NHIỀU loại setdown (vd 30mm và 50mm) khi chúng được phân biệt bằng
+    PATTERN hatch (vd SQDOTS=30, CROSS=50) — vì màu/đường nét thường BYLAYER.
+      • default_mm  : giá trị 'SETDOWN <n>mm' ĐẦU TIÊN (U.N.O).
+      • pattern2val : {TÊN_PATTERN: mm} suy từ swatch hatch đặt CẠNH mỗi dòng legend.
+    Chỉ map pattern khi legend có ≥2 dòng (nhiều loại); 1 dòng → chỉ dùng default."""
+    import re as _re, math as _mm
+    pat = _re.compile(r'set\s*down.*?(\d+)\s*mm', _re.I | _re.S)
+    spaces = []
+    try:
+        spaces.append(doc.modelspace())
+    except Exception:
+        pass
+    try:
+        for nm in doc.layouts.names():
+            if nm.lower() != "model":
+                spaces.append(doc.layouts.get(nm))
+    except Exception:
+        pass
+
+    def _hcent(h):
+        xs = []; ys = []
+        for pth in h.paths:
+            if hasattr(pth, "vertices"):
+                for v in pth.vertices:
+                    xs.append(v[0]); ys.append(v[1])
+            if hasattr(pth, "edges"):
+                for ed in pth.edges:
+                    if hasattr(ed, "start"):
+                        xs.append(ed.start[0]); ys.append(ed.start[1])
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    default_mm = None
+    pattern2val = {}
+    for sp in spaces:
+        lines = []                      # (mm, x, y) các dòng 'SETDOWN <n>mm'
+        for e in sp.query("TEXT MTEXT"):
+            try:
+                txt = e.plain_text() if e.dxftype() == "MTEXT" else e.dxf.text
+            except Exception:
+                txt = getattr(e.dxf, "text", "")
+            m = pat.search(txt or "")
+            if not m:
+                continue
+            try:
+                ins = e.dxf.insert
+            except Exception:
+                continue
+            lines.append((int(m.group(1)), ins.x, ins.y))
+        if not lines:
+            continue
+        if default_mm is None:
+            default_mm = lines[0][0]
+        if len(lines) < 2:              # 1 loại → khỏi cần map pattern
+            continue
+        gap = min(_mm.hypot(a[1]-b[1], a[2]-b[2])
+                  for i, a in enumerate(lines) for b in lines[i+1:]) or 1.0
+        guard = gap * 4.0
+        hatches = [(pn, _hcent(h)) for h in sp.query("HATCH")
+                   for pn in [str(getattr(h.dxf, "pattern_name", "") or "")]
+                   if pn and pn.upper() != "SOLID" and _hcent(h) is not None]
+        for mm_val, x, y in lines:       # mỗi dòng → swatch hatch GẦN NHẤT
+            best = None; bestd = 1e18
+            for pn, c in hatches:
+                d = _mm.hypot(x - c[0], y - c[1])
+                if d < bestd:
+                    bestd = d; best = pn.upper()
+            if best is not None and bestd <= guard:
+                pattern2val.setdefault(best, mm_val)
+    return (default_mm if default_mm is not None else fallback), pattern2val
+
+
 def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.8,
-                             setdown_default=30):
+                             setdown_default=30, setdown_patterns=None):
     """Chia mỗi tấm sàn thành nhiều VÙNG theo nét STEP / SOFFIT STEP, rồi gán
     bề dày (SLAB_DEPTH) và cao độ TOC cho từng vùng.
 
@@ -351,16 +426,33 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         if len(pts) >= 4:
             panel_loops.append(LineString(pts))
 
+    # Polygon HỢP của các ranh SLAB_PANEL. Callout bên trong panel THUỘC VỀ panel
+    # (xử lý riêng ở bước carve panel) → KHÔNG được tính vào bề dày vùng NỀN, nếu
+    # không vùng nền lớn sẽ "nuốt" callout của panel và chọn nhầm bề dày.
+    panel_area = None
+    if panel_loops:
+        try:
+            _pf = [g for g in polygonize(unary_union(panel_loops)) if g.area > 0.05]
+            if _pf:
+                panel_area = unary_union(_pf)
+        except Exception:
+            panel_area = None
+
     def _d(a, b):
         return _m.hypot(a[0]-b[0], a[1]-b[1])
 
     # ── Callout bề dày: pairing theo CIRCLE (đích leader thật) ──
+    import re as _re
+    def _first_num(txt):
+        """Lấy số đầu tiên trong chuỗi → '260 MIN' = 260, '215' = 215."""
+        m = _re.search(r"[-+]?\d+(?:\.\d+)?", txt)
+        return float(m.group()) if m else None
     dtexts = []
     for t in q(depth_l, "TEXT"):
-        try:
-            v = int(round(float(t.dxf.text.strip())))
-        except (ValueError, TypeError):
+        v0 = _first_num(t.dxf.text.strip())
+        if v0 is None:
             continue
+        v = int(round(v0))
         dtexts.append((v, (t.dxf.insert.x*s, t.dxf.insert.y*s)))
     circles = [(c.dxf.center.x*s, c.dxf.center.y*s) for c in q(depth_l, "CIRCLE")]
     segs = []                            # đoạn leader ứng viên (LINE + polyline hở)
@@ -577,12 +669,17 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
             return pick, len(cnt)
 
         from collections import Counter as _Ctr
-        glob_depth = _Ctr(v for v, _ in depth_pts)
+        # Bề dày vùng NỀN: bỏ callout nằm trong SLAB_PANEL (thuộc về panel, carve sau)
+        if panel_area is not None:
+            base_depth_pts = [(v, p) for v, p in depth_pts if not panel_area.contains(p)]
+        else:
+            base_depth_pts = depth_pts
+        glob_depth = _Ctr(v for v, _ in base_depth_pts)
 
         # Bề dày từng vùng
         thick = [None]*n
         for i in range(n):
-            dv, nd = near_val(depth_pts, regions[i], cent[i], glob_depth)
+            dv, nd = near_val(base_depth_pts, regions[i], cent[i], glob_depth)
             thick[i] = dv
             if dv is not None and nd > 1:
                 log_fn(f"  ⚠ Vùng sàn #{region_no+i+1} có nhiều giá trị bề dày → "
@@ -810,8 +907,52 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                    f"dưới panel (xoá trùng), bề dày theo callout", "info")
 
     # ── SETDOWN: vùng HẠ cao độ cục bộ (TOC = sàn dưới nó − giá trị setdown) ──
+    # NHIỀU loại setdown: mỗi vùng lấy giá trị theo PATTERN hatch phủ lên nó
+    # (map pattern→mm từ legend, vd SQDOTS=30 CROSS=50). Không khớp → mặc định.
     sd_layer = layers.get("setdown", "SETDOWN")
-    sd_polys = []
+    p2v = {str(k).upper(): v for k, v in (setdown_patterns or {}).items()}
+
+    sd_hatch_val = []                   # (polygon hatch, giá trị mm) — theo từng path
+    for e in q(sd_layer, "HATCH"):
+        pn = str(getattr(e.dxf, "pattern_name", "") or "").upper()
+        if pn not in p2v:
+            continue
+        for pth in e.paths:
+            xs = []; ys = []
+            if hasattr(pth, "vertices"):
+                for v in pth.vertices:
+                    xs.append(v[0]*s); ys.append(v[1]*s)
+            if hasattr(pth, "edges"):
+                for ed in pth.edges:
+                    if hasattr(ed, "start"):
+                        xs.append(ed.start[0]*s); ys.append(ed.start[1]*s)
+            if len(xs) >= 3:
+                try:
+                    hp = Polygon(zip(xs, ys))
+                    if not hp.is_valid:
+                        hp = hp.buffer(0)
+                    if hp.area > 0.001:
+                        sd_hatch_val.append((hp, p2v[pn]))
+                except Exception:
+                    pass
+
+    def _zone_setdown(pg):
+        """Giá trị setdown của 1 vùng: theo hatch pattern phủ lên (legend), else default."""
+        if not sd_hatch_val:
+            return setdown_default
+        try:
+            c = pg.representative_point()
+        except Exception:
+            return setdown_default
+        for hp, val in sd_hatch_val:
+            try:
+                if hp.contains(c) or hp.intersection(pg).area > 0.3 * pg.area:
+                    return val
+            except Exception:
+                continue
+        return setdown_default
+
+    sd_polys = []                       # (polygon vùng, giá trị mm)
     for e in q(sd_layer, "LWPOLYLINE"):
         # Nhận cả pseudo-closed (vẽ vòng về điểm đầu, cờ is_closed tắt)
         if len(e.get_points("xy")) < 3:
@@ -823,9 +964,11 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
             try:
                 pg = Polygon(pts)
                 if pg.is_valid and pg.area > 0.01:
-                    sd_polys.append(pg)
+                    sd_polys.append((pg, _zone_setdown(pg)))
             except Exception:
                 pass
+    if not sd_polys and sd_hatch_val:   # không có polyline → dùng chính hatch làm vùng
+        sd_polys = [(hp, val) for hp, val in sd_hatch_val]
     if sd_polys:
         parents = []
         for sd in out_slabs:
@@ -839,7 +982,7 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
         # Sàn-cha xét theo ƯU TIÊN giảm dần (priority cao trước, rồi diện tích nhỏ)
         parents.sort(key=lambda ps: (-ps[1]["priority"], ps[0].area))
 
-        def _emit(geom, base_t, base_toc, base_pr):
+        def _emit(geom, base_t, base_toc, base_pr, sdv):
             polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
             cnt = 0
             for piece in polys:
@@ -848,14 +991,15 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 ring = list(piece.exterior.coords)[:-1]
                 out_slabs.append({
                     "pts": ring,
-                    "thickness": max(50, base_t - setdown_default),  # hạ đáy giữ → dày −setdown
-                    "toc": base_toc - setdown_default,
+                    "thickness": max(50, base_t - sdv),  # hạ đáy giữ → dày −setdown
+                    "toc": base_toc - sdv,
                     "priority": base_pr + 1})
                 cnt += 1
             return cnt
 
-        nsd = 0
-        for poly in sd_polys:
+        nsd = 0; used_vals = set()
+        for poly, sdv in sd_polys:
+            used_vals.add(sdv)
             remaining = poly
             for pg, base in parents:        # cắt setdown theo TỪNG sàn-cha
                 if remaining.is_empty:
@@ -865,15 +1009,16 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
                 except Exception:
                     continue
                 if not inter.is_empty and inter.area >= 0.01:
-                    nsd += _emit(inter, base["thickness"], base["toc"], base["priority"])
+                    nsd += _emit(inter, base["thickness"], base["toc"], base["priority"], sdv)
                     try:
                         remaining = remaining.difference(pg)
                     except Exception:
                         remaining = poly.difference(pg)
             if not remaining.is_empty and remaining.area >= 0.01:   # phần ngoài mọi sàn
-                nsd += _emit(remaining, base_def_t, 0, 1)
-        log_fn(f"  Setdown: {nsd} mảnh — dày & TOC đều −{setdown_default}mm so với "
-               f"sàn dưới (tách theo vùng, priority cao hơn)", "info")
+                nsd += _emit(remaining, base_def_t, 0, 1, sdv)
+        _vs = ", ".join(f"{v}mm" for v in sorted(used_vals)) or f"{setdown_default}mm"
+        log_fn(f"  Setdown: {nsd} mảnh — dày & TOC −theo vùng ({_vs}; mặc định "
+               f"{setdown_default}mm), priority cao hơn sàn dưới", "info")
 
     return out_slabs
 
@@ -2011,11 +2156,15 @@ def run_conversion(config: dict, log_fn) -> bool:
         before = len(data["slabs"])
         log_fn("\n  → Detect slab depth & TOC by STEP / SOFFIT STEP...", "info")
         # Tự đọc giá trị setdown từ legend 'SETDOWN <n>mm U.N.O' (mọi layout)
-        sd_val = detect_setdown_value(doc, config.get("setdown_default", 30))
-        log_fn(f"  Setdown value (legend): {sd_val}mm", "info")
+        sd_val, sd_pats = detect_setdown_legend(doc, config.get("setdown_default", 30))
+        if sd_pats:
+            _pm = ", ".join(f"{k}={v}mm" for k, v in sd_pats.items())
+            log_fn(f"  Setdown legend: mặc định {sd_val}mm; theo pattern → {_pm}", "info")
+        else:
+            log_fn(f"  Setdown value (legend): {sd_val}mm", "info")
         data["slabs"] = subdivide_slabs_by_depth(
             data["slabs"], msp, unit_scale,
-            config.get("slab_depth_layers", {}), log_fn, slab_seg, sd_val)
+            config.get("slab_depth_layers", {}), log_fn, slab_seg, sd_val, sd_pats)
         log_fn(f"  Slab regions: {before} → {len(data['slabs'])} "
                f"(per-region thickness/TOC)", "info")
 

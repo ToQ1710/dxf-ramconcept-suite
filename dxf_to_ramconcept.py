@@ -893,6 +893,38 @@ def conform_zones_to_slab(items, slab_pts, seg, tol):
         it.points = new_pts
 
 
+def _outer_polys(polys):
+    """Cac path NGOAI CUNG cua 1 hatch — MOI cai = 1 vung rieng (vd 2 terraces
+    cung mau nam trong 1 HATCH entity). Path nam GON trong path khac (lo/hole)
+    bi loai. Khong co shapely -> giu tat ca (chap nhan du it lo hiem gap)."""
+    if len(polys) <= 1:
+        return polys
+    try:
+        from shapely.geometry import Polygon as _P
+    except Exception:
+        return polys
+    sp = []
+    for p in polys:
+        try:
+            g = _P(p)
+            if not g.is_valid:
+                g = g.buffer(0)
+        except Exception:
+            g = None
+        sp.append(g)
+    out = []
+    for i, gi in enumerate(sp):
+        if gi is None or gi.is_empty:
+            out.append(polys[i]); continue
+        ci = gi.representative_point()
+        inside = any(j != i and gj is not None and not gj.is_empty
+                     and gj.area > gi.area and gj.contains(ci)
+                     for j, gj in enumerate(sp))
+        if not inside:
+            out.append(polys[i])
+    return out or polys
+
+
 def parse_hatch_loads(dxf_path, legend, hatch_layer="LOAD_HATCH", max_seg=300.0):
     """Cac vung HATCH tren model -> list AreaItem (match mau voi legend)."""
     import ezdxf
@@ -913,16 +945,16 @@ def parse_hatch_loads(dxf_path, legend, hatch_layer="LOAD_HATCH", max_seg=300.0)
         polys = _hatch_polys(e, max_seg)
         if not polys:
             continue
-        poly = max(polys, key=_bb)            # path bbox lon nhat lam vung
-        cx = sum(p[0] for p in poly) / len(poly)
-        cy = sum(p[1] for p in poly) / len(poly)
-        key = (col, round(cx), round(cy), round(_bb(poly)))
-        if key in seen:                       # bo hatch trung lap (do explode block)
-            continue
-        seen.add(key)
-        it = AreaItem(idx, poly, hatch_layer)
-        it.name = name; it.sdl = sdl; it.ll = ll
-        items.append(it); idx += 1
+        for poly in _outer_polys(polys):      # MOI path ngoai cung = 1 vung rieng
+            cx = sum(p[0] for p in poly) / len(poly)
+            cy = sum(p[1] for p in poly) / len(poly)
+            key = (col, round(cx), round(cy), round(_bb(poly)))
+            if key in seen:                   # bo hatch trung lap (do explode block)
+                continue
+            seen.add(key)
+            it = AreaItem(idx, poly, hatch_layer)
+            it.name = name; it.sdl = sdl; it.ll = ll
+            items.append(it); idx += 1
     return items
 
 
