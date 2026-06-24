@@ -386,30 +386,6 @@ def point_in_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> boo
 # =============================================================================
 # RAM CONCEPT IMPORTER (background thread)
 # =============================================================================
-def _triangulate_polygon(pts):
-    """Tach 1 polygon (co the LOM) thanh cac tam giac NAM TRONG no. Dung khi RAM
-    Concept tu choi hinh lom phuc tap (vd vung PLANTER chu U). Khong co shapely
-    hoac that bai -> tra ve [pts] (giu nguyen)."""
-    try:
-        from shapely.geometry import Polygon, MultiPoint
-        from shapely.ops import triangulate
-    except Exception:
-        return [pts]
-    try:
-        poly = Polygon(pts)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty:
-            return [pts]
-        out = []
-        for tri in triangulate(MultiPoint(list(poly.exterior.coords))):
-            if poly.contains(tri.representative_point()) and tri.area > 1e-7:
-                out.append([(x, y) for x, y in list(tri.exterior.coords)[:-1]])
-        return out or [pts]
-    except Exception:
-        return [pts]
-
-
 def import_loads(cpt_path, area_items, sdl_layer_name, ll_layer_name,
                  unit_scale, offset_x, offset_y, log_fn, done_fn):
     try:
@@ -467,28 +443,6 @@ def import_loads(cpt_path, area_items, sdl_layer_name, ll_layer_name,
                 a += x1 * y2 - x2 * y1
             return abs(a) / 2.0
 
-        def _add_area(layer, mpts, value, name):
-            """Them 1 area load. Neu RAM tu choi hinh lom phuc tap -> tach tam giac
-            roi gan tung manh (cung gia tri). Tra ve (so_load, da_tach)."""
-            try:
-                al = layer.add_area_load(Polygon2D([Point2D(x, y) for x, y in mpts]))
-                al.set_load_values(0.0, 0.0, value, 0.0, 0.0)
-                if name:
-                    al.name = name
-                return 1, False
-            except Exception:
-                tris = _triangulate_polygon(mpts)
-                if len(tris) <= 1:
-                    raise                       # khong tach duoc -> caller log skip
-                cnt = 0
-                for tri in tris:
-                    al = layer.add_area_load(Polygon2D([Point2D(x, y) for x, y in tri]))
-                    al.set_load_values(0.0, 0.0, value, 0.0, 0.0)
-                    if name:
-                        al.name = name
-                    cnt += 1
-                return cnt, True
-
         n_sdl = n_ll = n_skip = 0
         for item in area_items:
             idx = getattr(item, "idx", "?")
@@ -502,18 +456,21 @@ def import_loads(cpt_path, area_items, sdl_layer_name, ll_layer_name,
                        f"({len(mpts)} pts, area={_poly_area(mpts):.2e} m2)")
                 continue
 
+            poly = Polygon2D([Point2D(x, y) for x, y in mpts])
             nm = (item.name or "").strip()   # giu nguyen dau nhu nguoi dung nhap
             try:
-                split = False
                 if item.sdl != 0.0:
-                    c, sp = _add_area(sdl_layer, mpts, item.sdl, nm)
-                    n_sdl += c; split = split or sp
+                    al = sdl_layer.add_area_load(poly)
+                    al.set_load_values(0.0, 0.0, item.sdl, 0.0, 0.0)
+                    if nm:
+                        al.name = nm
+                    n_sdl += 1
                 if item.ll != 0.0:
-                    c, sp = _add_area(ll_layer, mpts, item.ll, nm)
-                    n_ll += c; split = split or sp
-                if split:
-                    log_fn(f"  region #{idx} ('{nm}'): hinh lom phuc tap -> "
-                           f"tach tam giac de RAM nhan tai.")
+                    al = ll_layer.add_area_load(poly)
+                    al.set_load_values(0.0, 0.0, item.ll, 0.0, 0.0)
+                    if nm:
+                        al.name = nm
+                    n_ll += 1
             except Exception as e:
                 n_skip += 1
                 msg = str(e).strip().splitlines()[-1] if str(e).strip() else repr(e)

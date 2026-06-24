@@ -447,6 +447,11 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             if tail_dist > R:
                 continue
             tip = vv[0] if d0 > d1 else vv[-1]    # mui ten = dau XA khoi text
+            # LOAI leader cua RUN-LENGTH point load: mui ten cua chung co CAP SO
+            # (SDL/LL) ben canh. Leader transfer (DL=/LL=) thi mui ten chi vao cau
+            # kien, KHONG co cap so -> tranh giat nham leader '620/160' cho DL=940.
+            if _find_pair(texts, tip[0], tip[1]) is not None:
+                continue
             wd, wr = _wall_hit(tip)
             cd, cr = _col_hit(tip)
             if wr is not None and wd <= cd and wd <= TOL:
