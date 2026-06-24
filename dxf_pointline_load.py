@@ -410,44 +410,66 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
         if len(vv) >= 2:
             leads.append(vv)
 
-    n_tw = n_tc = n_tn = 0
-    for dx, dy, dl_val in dls:
-        # ghep LL gan nhat (cung khoi text, ngay tren/duoi DL)
+    def _wall_hit(p):
+        """(dist, (cl,L)) toi WALL OVER gan nhat (dung khoang cach toi CANH)."""
+        best = (1e18, None)
+        for flat, cl, L in wall_cl:
+            if _point_in_poly(p[0], p[1], flat):
+                return (0.0, (cl, L))
+            dd = min(math.hypot(p[0] - q[0], p[1] - q[1])
+                     for i in range(len(flat))
+                     for q in (_nearest_point_on_seg(p[0], p[1],
+                               flat[i][0], flat[i][1],
+                               flat[(i + 1) % len(flat)][0], flat[(i + 1) % len(flat)][1]),))
+            if dd < best[0]:
+                best = (dd, (cl, L))
+        return best
+
+    def _col_hit(p):
+        best = (1e18, None)
+        for col in columns:
+            dd = 0.0 if _point_in_poly(p[0], p[1], col["pts"]) \
+                else math.hypot(p[0] - col["c"][0], p[1] - col["c"][1])
+            if dd < best[0]:
+                best = (dd, col)
+        return best
+
+    # Ung vien: (tail_dist, di, lj, kind, ref). Mui ten = dau XA text; phan loai
+    # theo dau mui ten chi vao WALL OVER hay CO OVER. Gan 1-1 (greedy theo tail_dist)
+    # de tranh 2 text gan nhau giat nham cung 1 leader.
+    TOL = 800.0; R = 3200.0
+    cand = []
+    for di, (dx, dy, _dv) in enumerate(dls):
+        for lj, vv in enumerate(leads):
+            d0 = math.hypot(vv[0][0] - dx, vv[0][1] - dy)
+            d1 = math.hypot(vv[-1][0] - dx, vv[-1][1] - dy)
+            tail_dist = min(d0, d1)
+            if tail_dist > R:
+                continue
+            tip = vv[0] if d0 > d1 else vv[-1]    # mui ten = dau XA khoi text
+            wd, wr = _wall_hit(tip)
+            cd, cr = _col_hit(tip)
+            if wr is not None and wd <= cd and wd <= TOL:
+                cand.append((tail_dist, di, lj, "wall", wr))
+            elif cr is not None and cd <= TOL:
+                cand.append((tail_dist, di, lj, "col", cr))
+    cand.sort(key=lambda t: t[0])
+
+    used_t = set(); used_l = set()
+    n_tw = n_tc = 0
+    for tail_dist, di, lj, kind, ref in cand:
+        if di in used_t or lj in used_l:
+            continue
+        used_t.add(di); used_l.add(lj)
+        dx, dy, dl_val = dls[di]
         ll_val = 0.0
         if lls:
             lx, ly, lv = min(lls, key=lambda L: math.hypot(L[0] - dx, L[1] - dy))
             if math.hypot(lx - dx, ly - dy) < 1200:
                 ll_val = lv
-        if not leads:
-            continue
-        # leader co 1 dau gan khoi text -> dau KIA = mui ten (tip) chi vao cau kien
-        def _enddist(vv):
-            return min(math.hypot(vv[0][0] - dx, vv[0][1] - dy),
-                       math.hypot(vv[-1][0] - dx, vv[-1][1] - dy))
-        vv = min(leads, key=_enddist)
-        if _enddist(vv) > 2600:                 # khong co leader gan khoi text -> bo
-            continue
-        d0 = math.hypot(vv[0][0] - dx, vv[0][1] - dy)
-        d1 = math.hypot(vv[-1][0] - dx, vv[-1][1] - dy)
-        tip = vv[-1] if d0 < d1 else vv[0]
-
-        # tip chi vao WALL OVER hay CO OVER (gan nhat, trong nguong)?
-        wbest = None; wd = 1e18
-        for flat, cl, L in wall_cl:
-            dd = 0.0 if _point_in_poly(tip[0], tip[1], flat) \
-                else min(math.hypot(tip[0] - px, tip[1] - py) for px, py in flat)
-            if dd < wd:
-                wd = dd; wbest = (cl, L)
-        cbest = None; cd = 1e18
-        for col in columns:
-            dd = 0.0 if _point_in_poly(tip[0], tip[1], col["pts"]) \
-                else math.hypot(tip[0] - col["c"][0], tip[1] - col["c"][1])
-            if dd < cd:
-                cd = dd; cbest = col
-        TOL = 800.0
-        if wbest is not None and wd <= cd and wd <= TOL:
-            cl, L = wbest
-            Lm = max(L * unit_scale, 1e-6)       # chieu dai tuong (m)
+        if kind == "wall":
+            cl, L = ref
+            Lm = max(L * unit_scale, 1e-6)        # chieu dai tuong (m)
             segs = [(cl[i], cl[i + 1]) for i in range(len(cl) - 1)
                     if math.hypot(cl[i + 1][0] - cl[i][0], cl[i + 1][1] - cl[i][1]) > 1e-6]
             # gia tri kN/m sau khi chia chieu dai -> lam tron LEN boi so cua 5
@@ -455,13 +477,12 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
                           "segs": segs, "sdl": _ceil5(dl_val / Lm), "ll": _ceil5(ll_val / Lm),
                           "snapped": True, "transfer": True})
             n_tw += 1
-        elif cbest is not None and cd <= TOL:
-            sx, sy = cbest["c"]
-            points.append({"x": tip[0], "y": tip[1], "sx": sx, "sy": sy,
+        else:
+            sx, sy = ref["c"]
+            points.append({"x": sx, "y": sy, "sx": sx, "sy": sy,
                            "sdl": dl_val, "ll": ll_val, "snapped": True, "transfer": True})
             n_tc += 1
-        else:
-            n_tn += 1
+    n_tn = len(dls) - len(used_t)
 
     return {"points": points, "lines": lines, "columns": columns,
             "walls": wall_segs, "context": context,
