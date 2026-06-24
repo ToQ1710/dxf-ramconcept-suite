@@ -386,6 +386,38 @@ def point_in_polygon(x: float, y: float, poly: List[Tuple[float, float]]) -> boo
 # =============================================================================
 # RAM CONCEPT IMPORTER (background thread)
 # =============================================================================
+def _drop_collinear(pts, d_tol=0.002):
+    """Bo diem THANG HANG (goc co dien tich ~0). RAM Concept tu choi 'initial
+    geometry invalid' khi polygon co diem thang hang du shapely coi la hop le.
+    d_tol = khoang cach vuong goc toi da (m, sau khi scale) coi nhu thang hang.
+    Giu nguyen cung cong (diem lech > d_tol)."""
+    try:
+        from shapely.geometry import Polygon
+        g = Polygon(pts)
+        if not g.is_valid:
+            g = g.buffer(0)
+        g = g.simplify(d_tol, preserve_topology=True)
+        if g.geom_type == "Polygon" and not g.is_empty:
+            ring = list(g.exterior.coords)[:-1]
+            if len(ring) >= 3:
+                return ring
+    except Exception:
+        pass
+    import math as _mm
+    n = len(pts)
+    if n < 4:
+        return pts
+    out = []
+    for i in range(n):
+        a = out[-1] if out else pts[i - 1]
+        b = pts[i]; c = pts[(i + 1) % n]
+        dx = c[0] - a[0]; dy = c[1] - a[1]; L = _mm.hypot(dx, dy)
+        perp = abs((b[0] - a[0]) * dy - (b[1] - a[1]) * dx) / L if L > 1e-12 else 0.0
+        if perp > d_tol:
+            out.append(b)
+    return out if len(out) >= 3 else pts
+
+
 def import_loads(cpt_path, area_items, sdl_layer_name, ll_layer_name,
                  unit_scale, offset_x, offset_y, log_fn, done_fn):
     try:
@@ -449,6 +481,7 @@ def import_loads(cpt_path, area_items, sdl_layer_name, ll_layer_name,
             mpts = _clean_model_poly([(x * unit_scale + offset_x,
                                        y * unit_scale + offset_y)
                                       for x, y in item.points])
+            mpts = _drop_collinear(mpts)     # bo diem thang hang -> RAM khong tu choi
             # bo vung suy bien (it hon 3 dinh hoac dien tich ~ 0)
             if len(mpts) < 3 or _poly_area(mpts) < 1e-6:
                 n_skip += 1
