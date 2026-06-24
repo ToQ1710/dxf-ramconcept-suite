@@ -160,7 +160,8 @@ trong DXF rồi import vào RAM Concept — khỏi click nhập giá trị thủ
 Tool còn tự nhận **tải truyền** ghi dạng `DL=950(kN)` / `LL=160(kN)` (trên layer
 text) với **leader** chỉ vào cấu kiện tầng trên:
 - Mũi tên chỉ vào **WALL OVER** → **line load** rải dọc **đường tâm vách**, giá
-  trị = DL/chiều-dài và LL/chiều-dài (kN/m).
+  trị = DL/chiều-dài và LL/chiều-dài (kN/m), **làm tròn lên bội số của 5**
+  (vd 9→10, 11→15).
 - Mũi tên chỉ vào **CO OVER** (cột) → **point load** tại **tâm cột**, giá trị =
   DL và LL (kN).
 - Moment `MyEQX/MyEQY` được **bỏ qua** (chỉ gán lực đứng Fz). DL vào lớp

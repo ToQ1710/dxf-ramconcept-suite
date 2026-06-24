@@ -167,7 +167,8 @@ imports them into RAM Concept — no manual clicking of values.
 The tool also auto-detects **transfer loads** written as `DL=950(kN)` /
 `LL=160(kN)` (on the text layer) with a **leader** pointing to an element above:
 - Arrow on a **WALL OVER** → **line load** along the wall **centerline**, value =
-  DL/length and LL/length (kN/m).
+  DL/length and LL/length (kN/m), **rounded up to the nearest multiple of 5**
+  (e.g. 9→10, 11→15).
 - Arrow on a **CO OVER** (column) → **point load** at the **column center**,
   value = DL and LL (kN).
 - Moments `MyEQX/MyEQY` are **ignored** (vertical Fz only). DL goes to

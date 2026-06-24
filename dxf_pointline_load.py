@@ -218,6 +218,13 @@ def _numeric_texts(msp, text_layer):
 _OVER_RE = re.compile(r"^\s*(DL|LL)\s*=\s*(\d+(?:\.\d+)?)", re.I)
 
 
+def _ceil5(v):
+    """Lam tron LEN boi so cua 5 (vd 9->10, 11/12->15). Giu 0 = 0."""
+    if v <= 0:
+        return 0.0
+    return math.ceil(v / 5.0) * 5.0
+
+
 def _over_value_texts(msp, text_layer):
     """TEXT dang 'DL=950(kN)' / 'LL=160(kN)' tren text_layer (tai truyen tu cot/vach
     tang tren) -> [(x, y, 'DL'|'LL', value)]. Bo qua MyEQX/MyEQY (moment)."""
@@ -443,8 +450,9 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             Lm = max(L * unit_scale, 1e-6)       # chieu dai tuong (m)
             segs = [(cl[i], cl[i + 1]) for i in range(len(cl) - 1)
                     if math.hypot(cl[i + 1][0] - cl[i][0], cl[i + 1][1] - cl[i][1]) > 1e-6]
+            # gia tri kN/m sau khi chia chieu dai -> lam tron LEN boi so cua 5
             lines.append({"x1": cl[0][0], "y1": cl[0][1], "x2": cl[-1][0], "y2": cl[-1][1],
-                          "segs": segs, "sdl": dl_val / Lm, "ll": ll_val / Lm,
+                          "segs": segs, "sdl": _ceil5(dl_val / Lm), "ll": _ceil5(ll_val / Lm),
                           "snapped": True, "transfer": True})
             n_tw += 1
         elif cbest is not None and cd <= TOL:
