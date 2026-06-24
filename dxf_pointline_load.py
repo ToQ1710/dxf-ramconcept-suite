@@ -434,30 +434,36 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
                 best = (dd, col)
         return best
 
-    # Ung vien: (tail_dist, di, lj, kind, ref). Mui ten = dau XA text; phan loai
-    # theo dau mui ten chi vao WALL OVER hay CO OVER. Gan 1-1 (greedy theo tail_dist)
-    # de tranh 2 text gan nhau giat nham cung 1 leader.
-    TOL = 800.0; R = 3200.0
+    # LEADER-CENTRIC: voi MOI leader, MUI TEN = dau NAM TREN cau kien (WALL/CO OVER),
+    # TAIL = dau con lai (canh khoi text DL=/LL=). Loai leader cua RUN-LENGTH point
+    # load (mui ten co CAP SO ben canh). Sau do gan moi leader transfer vao DL text
+    # gan TAIL nhat (greedy 1-1, gioi han R) -> 'di theo huong mui ten' chinh xac.
+    TOL = 800.0; R = 3500.0
+    tlead = []                                    # (tail, kind, ref)
+    for vv in leads:
+        e0, e1 = vv[0], vv[-1]
+        w0, wr0 = _wall_hit(e0); c0, cr0 = _col_hit(e0)
+        w1, wr1 = _wall_hit(e1); c1, cr1 = _col_hit(e1)
+        el0 = min(w0, c0); el1 = min(w1, c1)
+        if min(el0, el1) > TOL:                   # khong dau nao cham cau kien
+            continue
+        if el0 <= el1:
+            arrow, tail = e0, e1; wd, wr, cd, cr = w0, wr0, c0, cr0
+        else:
+            arrow, tail = e1, e0; wd, wr, cd, cr = w1, wr1, c1, cr1
+        if _find_pair(texts, arrow[0], arrow[1]) is not None:
+            continue                              # leader run-length (mui ten co cap so)
+        if wr is not None and wd <= cd:
+            tlead.append((tail, "wall", wr))
+        elif cr is not None:
+            tlead.append((tail, "col", cr))
+
     cand = []
-    for di, (dx, dy, _dv) in enumerate(dls):
-        for lj, vv in enumerate(leads):
-            d0 = math.hypot(vv[0][0] - dx, vv[0][1] - dy)
-            d1 = math.hypot(vv[-1][0] - dx, vv[-1][1] - dy)
-            tail_dist = min(d0, d1)
-            if tail_dist > R:
-                continue
-            tip = vv[0] if d0 > d1 else vv[-1]    # mui ten = dau XA khoi text
-            # LOAI leader cua RUN-LENGTH point load: mui ten cua chung co CAP SO
-            # (SDL/LL) ben canh. Leader transfer (DL=/LL=) thi mui ten chi vao cau
-            # kien, KHONG co cap so -> tranh giat nham leader '620/160' cho DL=940.
-            if _find_pair(texts, tip[0], tip[1]) is not None:
-                continue
-            wd, wr = _wall_hit(tip)
-            cd, cr = _col_hit(tip)
-            if wr is not None and wd <= cd and wd <= TOL:
-                cand.append((tail_dist, di, lj, "wall", wr))
-            elif cr is not None and cd <= TOL:
-                cand.append((tail_dist, di, lj, "col", cr))
+    for lj, (tail, kind, ref) in enumerate(tlead):
+        for di, (dx, dy, _dv) in enumerate(dls):
+            tail_dist = math.hypot(tail[0] - dx, tail[1] - dy)
+            if tail_dist <= R:
+                cand.append((tail_dist, di, lj, kind, ref))
     cand.sort(key=lambda t: t[0])
 
     used_t = set(); used_l = set()
