@@ -635,7 +635,7 @@ def read_legend(dxf_path, hatch_layer="LOAD_HATCH"):
                     xs = [p[0] for p in allp]; ys = [p[1] for p in allp]
                     hatches.append({"cx": sum(xs)/len(xs), "cy": sum(ys)/len(ys),
                                     "w": max(xs)-min(xs), "h": max(ys)-min(ys),
-                                    "col": e.dxf.color})
+                                    "col": _hatch_color_key(e)})
             elif t in ("TEXT", "MTEXT"):
                 s = _text_plain(e)
                 if s:
@@ -893,17 +893,42 @@ def conform_zones_to_slab(items, slab_pts, seg, tol):
         it.points = new_pts
 
 
+def _hatch_color_key(e):
+    """Khoa mau de match legend. Uu tien true_color (RGB) vi nhieu hatch dung RGB
+    override: vd BIN va TERRACE cung ACI=133 nhung khac RGB -> phai tach theo RGB.
+    Khong co RGB -> dung ACI index."""
+    try:
+        tc = e.dxf.get("true_color", None)
+    except Exception:
+        tc = None
+    if tc:
+        return ("rgb", int(tc))
+    try:
+        return ("aci", int(e.dxf.color))
+    except Exception:
+        return ("aci", 0)
+
+
 def _outer_polys(polys):
     """Cac path NGOAI CUNG cua 1 hatch — MOI cai = 1 vung rieng (vd 2 terraces
-    cung mau nam trong 1 HATCH entity). Path nam GON trong path khac (lo/hole)
-    bi loai. Khong co shapely -> giu tat ca (chap nhan du it lo hiem gap)."""
-    if len(polys) <= 1:
-        return polys
+    cung mau nam trong 1 HATCH entity). Loai:
+      • path SUY BIEN / marker trang tri (dien tich ~0, vd ky hieu ben trong),
+      • path la LO (nam gon trong path lon hon).
+    Lam sach polygon TU CAT (buffer 0) de RAM Concept khong tu choi.
+    Khong co shapely -> loc theo bbox."""
+    if not polys:
+        return []
     try:
         from shapely.geometry import Polygon as _P
     except Exception:
-        return polys
-    sp = []
+        if len(polys) <= 1:
+            return polys
+        def _bbarea(p):
+            xs = [q[0] for q in p]; ys = [q[1] for q in p]
+            return (max(xs)-min(xs)) * (max(ys)-min(ys))
+        amax = max((_bbarea(p) for p in polys), default=0.0)
+        return [p for p in polys if _bbarea(p) >= amax * 1e-4] or polys
+    geoms = []
     for p in polys:
         try:
             g = _P(p)
@@ -911,18 +936,24 @@ def _outer_polys(polys):
                 g = g.buffer(0)
         except Exception:
             g = None
-        sp.append(g)
+        if g is not None and not g.is_empty and g.area > 0:
+            geoms.append(g)
+    if not geoms:
+        return []
+    amax = max(g.area for g in geoms)
+    thr = amax * 1e-4                        # bo marker/suy bien (area ~0)
+    geoms = [g for g in geoms if g.area >= thr]
     out = []
-    for i, gi in enumerate(sp):
-        if gi is None or gi.is_empty:
-            out.append(polys[i]); continue
+    for i, gi in enumerate(geoms):
         ci = gi.representative_point()
-        inside = any(j != i and gj is not None and not gj.is_empty
-                     and gj.area > gi.area and gj.contains(ci)
-                     for j, gj in enumerate(sp))
-        if not inside:
-            out.append(polys[i])
-    return out or polys
+        if any(j != i and geoms[j].area > gi.area and geoms[j].contains(ci)
+               for j in range(len(geoms))):
+            continue                          # la lo -> bo
+        parts = gi.geoms if gi.geom_type == "MultiPolygon" else [gi]
+        for part in parts:                    # buffer 0 co the tach nhieu manh
+            if part.area >= thr:
+                out.append([(x, y) for x, y in list(part.exterior.coords)[:-1]])
+    return out
 
 
 def parse_hatch_loads(dxf_path, legend, hatch_layer="LOAD_HATCH", max_seg=300.0):
@@ -938,7 +969,7 @@ def parse_hatch_loads(dxf_path, legend, hatch_layer="LOAD_HATCH", max_seg=300.0)
     for e in _explode_iter(msp):
         if e.dxftype() != "HATCH" or e.dxf.layer != hatch_layer:
             continue
-        col = e.dxf.color
+        col = _hatch_color_key(e)
         if col not in legend:
             continue
         name, sdl, ll = legend[col]
