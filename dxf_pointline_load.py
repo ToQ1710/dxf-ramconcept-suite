@@ -225,6 +225,48 @@ def _ceil5(v):
     return math.ceil(v / 5.0) * 5.0
 
 
+def _hungarian(cost):
+    """Gan TOI UU (min tong chi phi) bipartite. cost = ma tran n hang (DL text) x
+    m cot (leader). Tra ve assign[i] = cot gan cho hang i (-1 neu khong gan).
+    Dung de giu DUNG THU TU khi nhieu text/leader xep chong (greedy bi sai)."""
+    n = len(cost)
+    m = len(cost[0]) if n else 0
+    if n == 0 or m == 0:
+        return [-1] * n
+    INF = float("inf")
+    sz = max(n, m)
+    C = [[cost[i][j] if i < n and j < m else 0.0 for j in range(sz)] for i in range(sz)]
+    u = [0.0] * (sz + 1); v = [0.0] * (sz + 1)
+    p = [0] * (sz + 1); way = [0] * (sz + 1)
+    for i in range(1, sz + 1):
+        p[0] = i; j0 = 0
+        minv = [INF] * (sz + 1); used = [False] * (sz + 1)
+        while True:
+            used[j0] = True; i0 = p[j0]; delta = INF; j1 = -1
+            for j in range(1, sz + 1):
+                if not used[j]:
+                    cur = C[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur; way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]; j1 = j
+            for j in range(sz + 1):
+                if used[j]:
+                    u[p[j]] += delta; v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while j0:
+            j1 = way[j0]; p[j0] = p[j1]; j0 = j1
+    assign = [-1] * n
+    for j in range(1, sz + 1):
+        if p[j] != 0 and p[j] - 1 < n and j - 1 < m:
+            assign[p[j] - 1] = j - 1
+    return assign
+
+
 def _over_value_texts(msp, text_layer):
     """TEXT dang 'DL=950(kN)' / 'LL=160(kN)' tren text_layer (tai truyen tu cot/vach
     tang tren) -> [(x, y, 'DL'|'LL', value)]. Bo qua MyEQX/MyEQY (moment)."""
@@ -435,11 +477,11 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
         return best
 
     # LEADER-CENTRIC: voi MOI leader, MUI TEN = dau NAM TREN cau kien (WALL/CO OVER),
-    # TAIL = dau con lai (canh khoi text DL=/LL=). Loai leader cua RUN-LENGTH point
-    # load (mui ten co CAP SO ben canh). Sau do gan moi leader transfer vao DL text
-    # gan TAIL nhat (greedy 1-1, gioi han R) -> 'di theo huong mui ten' chinh xac.
-    TOL = 800.0; R = 3500.0
-    tlead = []                                    # (tail, kind, ref)
+    # TAIL = dau con lai (canh khoi text DL=/LL=). Leader cua RUN-LENGTH point load
+    # (mui ten co CAP SO ben canh) bi PHAT (uu tien leader sach) nhung VAN dung lam
+    # fallback -> giu duoc DL ma vach no chi vao bi crowd boi run-length (vd DL=500).
+    TOL = 800.0; R = 3500.0; PAIR_PEN = 1e5; BIG = 1e9
+    tlead = []                                    # (tail, kind, ref, has_pair)
     for vv in leads:
         e0, e1 = vv[0], vv[-1]
         w0, wr0 = _wall_hit(e0); c0, cr0 = _col_hit(e0)
@@ -448,30 +490,35 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
         if min(el0, el1) > TOL:                   # khong dau nao cham cau kien
             continue
         if el0 <= el1:
-            arrow, tail = e0, e1; wd, wr, cd, cr = w0, wr0, c0, cr0
+            arrow, tail, wd, wr, cd, cr = e0, e1, w0, wr0, c0, cr0
         else:
-            arrow, tail = e1, e0; wd, wr, cd, cr = w1, wr1, c1, cr1
-        if _find_pair(texts, arrow[0], arrow[1]) is not None:
-            continue                              # leader run-length (mui ten co cap so)
+            arrow, tail, wd, wr, cd, cr = e1, e0, w1, wr1, c1, cr1
+        has_pair = _find_pair(texts, arrow[0], arrow[1]) is not None
         if wr is not None and wd <= cd:
-            tlead.append((tail, "wall", wr))
+            tlead.append((tail, "wall", wr, has_pair))
         elif cr is not None:
-            tlead.append((tail, "col", cr))
+            tlead.append((tail, "col", cr, has_pair))
 
-    cand = []
-    for lj, (tail, kind, ref) in enumerate(tlead):
-        for di, (dx, dy, _dv) in enumerate(dls):
-            tail_dist = math.hypot(tail[0] - dx, tail[1] - dy)
-            if tail_dist <= R:
-                cand.append((tail_dist, di, lj, kind, ref))
-    cand.sort(key=lambda t: t[0])
+    # Gan TOI UU (Hungarian) -> giu dung thu tu khi text/leader xep chong (vd DL=146
+    # vach tren, DL=9 vach giua, DL=746 vach duoi). Chi phi = tail_dist + phat cap so.
+    n_tw = n_tc = n_tn = 0
+    if dls and tlead:
+        cost = []
+        for (dx, dy, _dv) in dls:
+            row = []
+            for (tail, kind, ref, hp) in tlead:
+                td = math.hypot(tail[0] - dx, tail[1] - dy)
+                row.append(BIG if td > R else td + (PAIR_PEN if hp else 0.0))
+            cost.append(row)
+        assign = _hungarian(cost)
+    else:
+        assign = [-1] * len(dls)
 
-    used_t = set(); used_l = set()
-    n_tw = n_tc = 0
-    for tail_dist, di, lj, kind, ref in cand:
-        if di in used_t or lj in used_l:
+    for di, lj in enumerate(assign):
+        if lj < 0 or cost[di][lj] >= BIG:         # khong co leader hop le trong R
+            n_tn += 1
             continue
-        used_t.add(di); used_l.add(lj)
+        tail, kind, ref, hp = tlead[lj]
         dx, dy, dl_val = dls[di]
         ll_val = 0.0
         if lls:
@@ -493,7 +540,6 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             points.append({"x": sx, "y": sy, "sx": sx, "sy": sy,
                            "sdl": dl_val, "ll": ll_val, "snapped": True, "transfer": True})
             n_tc += 1
-    n_tn = len(dls) - len(used_t)
 
     return {"points": points, "lines": lines, "columns": columns,
             "walls": wall_segs, "context": context,
