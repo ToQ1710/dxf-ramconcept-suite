@@ -156,6 +156,18 @@ trong DXF rồi import vào RAM Concept — khỏi click nhập giá trị thủ
    `add_point_load`, line load dùng `add_line_load`, ghi vào 2 lớp
    `SI Dead Loading` (SDL) và `Live (Reducible) Loading` (LL).
 
+**Tải truyền từ cột/vách tầng trên (DL/LL over)**
+Tool còn tự nhận **tải truyền** ghi dạng `DL=950(kN)` / `LL=160(kN)` (trên layer
+text) với **leader** chỉ vào cấu kiện tầng trên:
+- Mũi tên chỉ vào **WALL OVER** → **line load** rải dọc **đường tâm vách**, giá
+  trị = DL/chiều-dài và LL/chiều-dài (kN/m).
+- Mũi tên chỉ vào **CO OVER** (cột) → **point load** tại **tâm cột**, giá trị =
+  DL và LL (kN).
+- Moment `MyEQX/MyEQY` được **bỏ qua** (chỉ gán lực đứng Fz). DL vào lớp
+  `SI Dead Loading`, LL vào `Live (Reducible) Loading`.
+- Leader nào chỉ vào chỗ không có WALL OVER/CO OVER sẽ báo **unmatched** trong
+  log để bạn xử lý tay.
+
 > Luôn kiểm tra canvas (tải nằm đúng trên đường bao sàn đỏ) trước khi import —
 > đó là cách bạn xác nhận phép canh đã đúng.
 

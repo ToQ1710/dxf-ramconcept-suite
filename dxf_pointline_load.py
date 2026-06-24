@@ -215,6 +215,22 @@ def _numeric_texts(msp, text_layer):
     return out
 
 
+_OVER_RE = re.compile(r"^\s*(DL|LL)\s*=\s*(\d+(?:\.\d+)?)", re.I)
+
+
+def _over_value_texts(msp, text_layer):
+    """TEXT dang 'DL=950(kN)' / 'LL=160(kN)' tren text_layer (tai truyen tu cot/vach
+    tang tren) -> [(x, y, 'DL'|'LL', value)]. Bo qua MyEQX/MyEQY (moment)."""
+    out = []
+    for e in msp:
+        if e.dxf.layer != text_layer or e.dxftype() != "TEXT":
+            continue
+        m = _OVER_RE.match(e.dxf.text.strip())
+        if m:
+            out.append((e.dxf.insert.x, e.dxf.insert.y, m.group(1).upper(), float(m.group(2))))
+    return out
+
+
 def _find_pair(texts, x, y, radius=1800.0, gap_x=400.0, gap_min=200.0, gap_max=900.0):
     """Cap so xep doc gan (x,y). Tra ve (sdl, ll) (tren=SDL, duoi=LL) hoac None."""
     cand = sorted((math.hypot(tx - x, ty - y), tx, ty, v) for tx, ty, v in texts)
@@ -253,9 +269,10 @@ def _iter_entities(container, depth=0):
 
 
 def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer,
-             wall_seg=800.0):
+             wall_seg=800.0, unit_scale=0.001):
     """Doc tat ca: tai, cot/vach de snap, va context de ve.
-    Tra ve dict {points, lines, columns, walls, context, layers}."""
+    Tra ve dict {points, lines, columns, walls, context, layers}.
+    unit_scale: doi mm DXF -> m (de quy tai truyen DL/LL tong -> kN/m theo chieu dai)."""
     import ezdxf
     doc = ezdxf.readfile(dxf_path)
     msp = doc.modelspace()
@@ -293,12 +310,14 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
 
     # duong tam cho moi mieng vach (loc bo cot vuong; vach cong -> nhieu doan)
     wall_segs = []
+    wall_cl = []          # (outline_flat, centerline_pts, length) -> cho transfer line load
     for vp, closed in wall_polys:
         flat = [(x, y) for x, y, _b in vp]
         if not _wall_model(flat):          # khong thuon dai -> cot, bo qua
             continue
         cl = _outline_centerline(vp, closed)
         if cl and len(cl) >= 2:
+            wall_cl.append((flat, cl, _polyline_len(cl)))
             for i in range(len(cl) - 1):
                 a, b = cl[i], cl[i + 1]
                 if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6:
@@ -367,8 +386,78 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
         lines.append({"x1": a0[0], "y1": a0[1], "x2": b0[0], "y2": b0[1],
                       "segs": segs, "sdl": pr[0], "ll": pr[1], "snapped": snapped})
 
+    # ----- TRANSFER loads: 'DL=/LL=' + LEADER -> WALL OVER (line) / CO OVER (point) -----
+    # Vach over -> line load doc CENTERLINE, gia tri = DL/chieu-dai (kN/m).
+    # Cot  over -> point load tai TAM cot, gia tri = DL (kN).
+    over = _over_value_texts(msp, text_layer)
+    dls = [(x, y, v) for x, y, k, v in over if k == "DL"]
+    lls = [(x, y, v) for x, y, k, v in over if k == "LL"]
+    leads = []
+    for e in msp:
+        if e.dxf.layer != geom_layer or e.dxftype() != "LEADER":
+            continue
+        try:
+            vv = [(p[0], p[1]) for p in e.vertices]
+        except Exception:
+            vv = []
+        if len(vv) >= 2:
+            leads.append(vv)
+
+    n_tw = n_tc = n_tn = 0
+    for dx, dy, dl_val in dls:
+        # ghep LL gan nhat (cung khoi text, ngay tren/duoi DL)
+        ll_val = 0.0
+        if lls:
+            lx, ly, lv = min(lls, key=lambda L: math.hypot(L[0] - dx, L[1] - dy))
+            if math.hypot(lx - dx, ly - dy) < 1200:
+                ll_val = lv
+        if not leads:
+            continue
+        # leader co 1 dau gan khoi text -> dau KIA = mui ten (tip) chi vao cau kien
+        def _enddist(vv):
+            return min(math.hypot(vv[0][0] - dx, vv[0][1] - dy),
+                       math.hypot(vv[-1][0] - dx, vv[-1][1] - dy))
+        vv = min(leads, key=_enddist)
+        if _enddist(vv) > 2600:                 # khong co leader gan khoi text -> bo
+            continue
+        d0 = math.hypot(vv[0][0] - dx, vv[0][1] - dy)
+        d1 = math.hypot(vv[-1][0] - dx, vv[-1][1] - dy)
+        tip = vv[-1] if d0 < d1 else vv[0]
+
+        # tip chi vao WALL OVER hay CO OVER (gan nhat, trong nguong)?
+        wbest = None; wd = 1e18
+        for flat, cl, L in wall_cl:
+            dd = 0.0 if _point_in_poly(tip[0], tip[1], flat) \
+                else min(math.hypot(tip[0] - px, tip[1] - py) for px, py in flat)
+            if dd < wd:
+                wd = dd; wbest = (cl, L)
+        cbest = None; cd = 1e18
+        for col in columns:
+            dd = 0.0 if _point_in_poly(tip[0], tip[1], col["pts"]) \
+                else math.hypot(tip[0] - col["c"][0], tip[1] - col["c"][1])
+            if dd < cd:
+                cd = dd; cbest = col
+        TOL = 800.0
+        if wbest is not None and wd <= cd and wd <= TOL:
+            cl, L = wbest
+            Lm = max(L * unit_scale, 1e-6)       # chieu dai tuong (m)
+            segs = [(cl[i], cl[i + 1]) for i in range(len(cl) - 1)
+                    if math.hypot(cl[i + 1][0] - cl[i][0], cl[i + 1][1] - cl[i][1]) > 1e-6]
+            lines.append({"x1": cl[0][0], "y1": cl[0][1], "x2": cl[-1][0], "y2": cl[-1][1],
+                          "segs": segs, "sdl": dl_val / Lm, "ll": ll_val / Lm,
+                          "snapped": True, "transfer": True})
+            n_tw += 1
+        elif cbest is not None and cd <= TOL:
+            sx, sy = cbest["c"]
+            points.append({"x": tip[0], "y": tip[1], "sx": sx, "sy": sy,
+                           "sdl": dl_val, "ll": ll_val, "snapped": True, "transfer": True})
+            n_tc += 1
+        else:
+            n_tn += 1
+
     return {"points": points, "lines": lines, "columns": columns,
             "walls": wall_segs, "context": context,
+            "transfer": {"wall": n_tw, "col": n_tc, "unmatched": n_tn},
             "layers": sorted(l.dxf.name for l in doc.layers)}
 
 
@@ -779,6 +868,10 @@ class App(tk.Tk):
             wseg = float(self.wall_seg.get())
         except ValueError:
             wseg = 800.0
+        try:
+            uscale = float(self.unit_var.get())
+        except ValueError:
+            uscale = 0.001
 
         def worker():
             try:
@@ -788,7 +881,7 @@ class App(tk.Tk):
                                self.col_layer.get().strip() or DEFAULT_COL_LAYER,
                                self.wall_layer.get().strip() or DEFAULT_WALL_LAYER,
                                self.edge_layer.get().strip() or DEFAULT_EDGE_LAYER,
-                               wseg)
+                               wseg, uscale)
             except Exception as exc:
                 self._log_safe(f"[ERROR] {exc}")
                 return
@@ -806,6 +899,12 @@ class App(tk.Tk):
         self._log(f"Detected {len(self.points)} point loads "
                   f"({ns_p} snapped to a column), "
                   f"{len(self.lines)} line loads ({ns_l} snapped to a wall).")
+        tr = res.get("transfer")
+        if tr and (tr["wall"] or tr["col"] or tr["unmatched"]):
+            self._log(f"  Transfer (DL/LL over): {tr['wall']} -> WALL OVER (line, kN/m "
+                      f"= DL/length), {tr['col']} -> CO OVER (point, kN)."
+                      + (f"  {tr['unmatched']} unmatched (leader tip not on wall/column)."
+                         if tr["unmatched"] else ""))
         self._log(f"Context: {len(self.context['polys'])} plan lines, "
                   f"{len(self.context['circles'])} circles drawn.")
         self._fit_view()

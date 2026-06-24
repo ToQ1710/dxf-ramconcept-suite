@@ -163,6 +163,18 @@ imports them into RAM Concept — no manual clicking of values.
    `add_point_load`, line loads use `add_line_load`, written to the
    `SI Dead Loading` (SDL) and `Live (Reducible) Loading` (LL) layers.
 
+**Transfer loads from columns/walls above (DL/LL over)**
+The tool also auto-detects **transfer loads** written as `DL=950(kN)` /
+`LL=160(kN)` (on the text layer) with a **leader** pointing to an element above:
+- Arrow on a **WALL OVER** → **line load** along the wall **centerline**, value =
+  DL/length and LL/length (kN/m).
+- Arrow on a **CO OVER** (column) → **point load** at the **column center**,
+  value = DL and LL (kN).
+- Moments `MyEQX/MyEQY` are **ignored** (vertical Fz only). DL goes to
+  `SI Dead Loading`, LL to `Live (Reducible) Loading`.
+- Any leader whose tip is not on a WALL OVER/CO OVER element is reported as
+  **unmatched** in the log for manual handling.
+
 > Always check the canvas overlay (loads sitting on the red slab outline) before
 > importing — that is your verification that the alignment is correct.
 
