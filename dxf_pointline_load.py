@@ -495,9 +495,9 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             arrow, tail, wd, wr, cd, cr = e1, e0, w1, wr1, c1, cr1
         has_pair = _find_pair(texts, arrow[0], arrow[1]) is not None
         if wr is not None and wd <= cd:
-            tlead.append((tail, "wall", wr, has_pair))
+            tlead.append((tail, "wall", wr, has_pair, arrow))
         elif cr is not None:
-            tlead.append((tail, "col", cr, has_pair))
+            tlead.append((tail, "col", cr, has_pair, arrow))
 
     # Gan TOI UU (Hungarian) -> giu dung thu tu khi text/leader xep chong (vd DL=146
     # vach tren, DL=9 vach giua, DL=746 vach duoi). Chi phi = tail_dist + phat cap so.
@@ -506,7 +506,7 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
         cost = []
         for (dx, dy, _dv) in dls:
             row = []
-            for (tail, kind, ref, hp) in tlead:
+            for (tail, kind, ref, hp, arrow) in tlead:
                 td = math.hypot(tail[0] - dx, tail[1] - dy)
                 row.append(BIG if td > R else td + (PAIR_PEN if hp else 0.0))
             cost.append(row)
@@ -514,11 +514,13 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
     else:
         assign = [-1] * len(dls)
 
+    used_arrows = []                              # mui ten leader da dung cho transfer
     for di, lj in enumerate(assign):
         if lj < 0 or cost[di][lj] >= BIG:         # khong co leader hop le trong R
             n_tn += 1
             continue
-        tail, kind, ref, hp = tlead[lj]
+        tail, kind, ref, hp, arrow = tlead[lj]
+        used_arrows.append(arrow)
         dx, dy, dl_val = dls[di]
         ll_val = 0.0
         if lls:
@@ -540,6 +542,17 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             points.append({"x": sx, "y": sy, "sx": sx, "sy": sy,
                            "sdl": dl_val, "ll": ll_val, "snapped": True, "transfer": True})
             n_tc += 1
+
+    # Leader da dung cho TRANSFER thi KHONG de point load run-length trung tai mui
+    # ten do (vd DL=500 da la line load -> bo point Fz=200 sinh ra tu cung leader).
+    if used_arrows:
+        kept = []
+        for p in points:
+            if not p.get("transfer") and any(
+                    math.hypot(p["x"] - ax, p["y"] - ay) < 60 for ax, ay in used_arrows):
+                continue
+            kept.append(p)
+        points = kept
 
     return {"points": points, "lines": lines, "columns": columns,
             "walls": wall_segs, "context": context,
