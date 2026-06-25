@@ -707,6 +707,10 @@ def read_legend(dxf_path, hatch_layer="LOAD_HATCH"):
             nums = [float(tt) for xx, tt in band if num_re.fullmatch(tt) and xx > ref]
             return name, name_x, nums
 
+        # Format GOP: ca hang la 1 text 'NAME ... SDL x ... LL y' (vd legend o
+        # Layout1 cua mot so ban ve) thay vi ten + so o cac text rieng.
+        sdll_re = re.compile(r"SDL\s*(-?\d+(?:\.\d+)?).*?LL\s*(-?\d+(?:\.\d+)?)", re.I | re.S)
+
         n_before = len(legend)
         name_cols = []                                 # x cua cot TEN (de doi chieu base)
         for h in swatches:
@@ -715,6 +719,18 @@ def read_legend(dxf_path, hatch_layer="LOAD_HATCH"):
             if name and len(nums) >= 2:
                 legend[h["col"]] = (name, nums[0], nums[1])
                 name_cols.append(name_x)
+                continue
+            # Fallback: text gop 'NAME ... SDL x ... LL y' tren cung hang, ben phai swatch
+            band = sorted((xx, tt) for xx, yy, tt in texts
+                          if abs(yy - h["cy"]) < ty and xx > h["cx"])
+            for xx, tt in band:
+                m = sdll_re.search(tt)
+                if m:
+                    nm = tt[:m.start()].strip(" \t:-\xa0")
+                    if nm:
+                        legend[h["col"]] = (nm, float(m.group(1)), float(m.group(2)))
+                        name_cols.append(xx)
+                    break
         # BASE = hang LEGEND khong co swatch (vd CAR PARK). Quet rong, doi chieu cot ten.
         if base is None and (len(legend) - n_before) >= 2 and name_cols:
             rowh = max(h["h"] for h in swatches)
