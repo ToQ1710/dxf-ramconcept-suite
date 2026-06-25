@@ -293,6 +293,33 @@ def _find_pair(texts, x, y, radius=1800.0, gap_x=400.0, gap_min=200.0, gap_max=9
     return None
 
 
+def _all_pairs(texts, gap_x=400.0, gap_min=200.0, gap_max=900.0):
+    """Tat ca cap so XEP DOC (SDL tren, LL duoi) tren text layer ->
+    [(sdl, ll, x_mid, y_mid)]. Cung tieu chi voi _find_pair. Dung de gan cap gia
+    tri cho leader bang Hungarian (moi cap 1 leader) -> tranh 2 leader gan nhau
+    cung an 1 cap (vd 250/50 va 550/80)."""
+    pairs = []
+    n = len(texts)
+    for i in range(n):
+        xi, yi, vi = texts[i]
+        best = None; bestd = 1e18
+        for j in range(n):
+            if i == j:
+                continue
+            xj, yj, vj = texts[j]
+            if abs(xi - xj) < gap_x and gap_min < (yi - yj) < gap_max:
+                if (yi - yj) < bestd:          # LL gan nhat NGAY DUOI SDL
+                    bestd = yi - yj
+                    best = (vi, vj, (xi + xj) / 2.0, (yi + yj) / 2.0)
+        if best is not None:
+            pairs.append(best)
+    uniq = []
+    for p in pairs:                            # dedup theo vi tri
+        if not any(abs(p[2] - q[2]) < 1.0 and abs(p[3] - q[3]) < 1.0 for q in uniq):
+            uniq.append(p)
+    return uniq
+
+
 def _poly_pts(e, unit=1.0):
     return [(p[0] * unit, p[1] * unit) for p in e.get_points("xy")]
 
@@ -372,8 +399,11 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
                 if math.hypot(b[0] - a[0], b[1] - a[1]) > 1e-6:
                     wall_segs.append((a, b))
 
-    # ----- point loads (LEADER) -----
-    points = []
+    # ----- point loads (LEADER): gan cap gia tri TOI UU (Hungarian) -----
+    # Moi leader (dau mui ten v[0]) -> 1 cap so RIENG. Tranh 2 leader gan nhau cung
+    # an 1 cap (vd cot tren=250/50, cot duoi=550/80 -> truoc day ca 2 deu 250).
+    pairs_all = _all_pairs(texts)
+    pt_v0 = []
     for e in msp:
         if e.dxf.layer != geom_layer or e.dxftype() != "LEADER":
             continue
@@ -381,15 +411,27 @@ def read_dxf(dxf_path, geom_layer, text_layer, col_layer, wall_layer, edge_layer
             v = list(e.vertices)
         except Exception:
             continue
-        if not v:
-            continue
-        tx, ty = v[0][0], v[0][1]
-        pr = _find_pair(texts, tx, ty)
-        if not pr:
-            continue
-        sx, sy = _snap_to_column(tx, ty, columns)
-        points.append({"x": tx, "y": ty, "sx": sx, "sy": sy,
-                       "sdl": pr[0], "ll": pr[1], "snapped": (sx, sy) != (tx, ty)})
+        if v:
+            pt_v0.append((v[0][0], v[0][1]))
+    points = []
+    if pt_v0 and pairs_all:
+        PR = 1800.0; BIGP = 1e9
+        costp = []
+        for (lx, ly) in pt_v0:
+            row = []
+            for (sdl, ll, px, py) in pairs_all:
+                dd = math.hypot(lx - px, ly - py)
+                row.append(dd if dd <= PR else BIGP)
+            costp.append(row)
+        ap = _hungarian(costp)
+        for li, (lx, ly) in enumerate(pt_v0):
+            pj = ap[li]
+            if pj < 0 or costp[li][pj] >= BIGP:
+                continue
+            sdl, ll, px, py = pairs_all[pj]
+            sx, sy = _snap_to_column(lx, ly, columns)
+            points.append({"x": lx, "y": ly, "sx": sx, "sy": sy,
+                           "sdl": sdl, "ll": ll, "snapped": (sx, sy) != (lx, ly)})
 
     # ----- line loads (DIMENSION) -----
     lines = []
