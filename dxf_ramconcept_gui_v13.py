@@ -12,6 +12,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime
 
+
+class ConversionCancelled(Exception):
+    """Raised khi người dùng bấm STOP để dừng việc dựng model/mesh."""
+    pass
+
 # ─────────────────────────────────────────────────────────────
 # PALETTE / STYLE  —  PTX brand (navy + steel-gray)
 # ─────────────────────────────────────────────────────────────
@@ -1023,7 +1028,13 @@ def subdivide_slabs_by_depth(slabs, msp, unit_scale, layers, log_fn, slab_seg=0.
     return out_slabs
 
 
-def run_conversion(config: dict, log_fn) -> bool:
+def run_conversion(config: dict, log_fn, should_cancel=None):
+    """should_cancel: callable trả về True khi người dùng yêu cầu dừng.
+    Trả về True (thành công), False (lỗi) hoặc 'cancelled' (bị dừng)."""
+    def _ck():
+        if should_cancel is not None and should_cancel():
+            raise ConversionCancelled()
+
     dxf_file     = config["dxf_file"]
     cpt_template = config["cpt_template"]
     cpt_output   = config["cpt_output"]
@@ -1416,6 +1427,7 @@ def run_conversion(config: dict, log_fn) -> bool:
     rect_info  = {}      # wall_key → thick_m cho centerline rect (authoritative)
 
     for entity in msp:
+        _ck()
         layer = entity.dxf.layer.upper()
         key   = rev_map.get(layer)
         if key is None:
@@ -2278,6 +2290,7 @@ def run_conversion(config: dict, log_fn) -> bool:
                 log_fn("  ⚠ Skipped — slab creation method not found", "warning")
             else:
                 for i, slab_item in enumerate(data["slabs"]):
+                    _ck()
                     if isinstance(slab_item, dict):
                         pts  = slab_item["pts"]
                         t    = slab_item.get("thickness", slab_thick)
@@ -2307,6 +2320,7 @@ def run_conversion(config: dict, log_fn) -> bool:
                 log_fn("  ⚠ Skipped — column creation method not found", "warning")
             else:
                 for i, col_data in enumerate(data["columns"]):
+                    _ck()
                     if isinstance(col_data, dict):
                         cx    = col_data["cx"]
                         cy    = col_data["cy"]
@@ -2350,6 +2364,7 @@ def run_conversion(config: dict, log_fn) -> bool:
                 log_fn("  ⚠ Skipped — wall creation method not found", "warning")
             else:
                 for i, wall_entry in enumerate(data["walls"]):
+                    _ck()
                     p1, p2 = wall_entry[0], wall_entry[1]
                     # thickness từ DXF (đã đo được khi merge); None → dùng fallback
                     detected_thick_m = wall_entry[2] if len(wall_entry) > 2 else None
@@ -2420,6 +2435,7 @@ def run_conversion(config: dict, log_fn) -> bool:
                 log_fn("  ⚠ Skipped — opening creation method not found", "warning")
             else:
                 for i, pts in enumerate(data["openings"]):
+                    _ck()
                     cpts = _clean_polygon(pts)
                     if cpts is None:
                         log_fn(f"  ⚠ Opening #{i+1} skipped — degenerate geometry", "warning")
@@ -2429,6 +2445,9 @@ def run_conversion(config: dict, log_fn) -> bool:
                     log_fn(f"  ✓ Opening #{i+1} — {len(cpts)} vertices", "success")
 
         # ── Mesh ──────────────────────────────────────────────
+        # Checkpoint cuối: mesh là 1 lệnh API chạy liền không cắt ngang được,
+        # nên dừng TRƯỚC khi bắt đầu mesh (đỡ tốn thời gian chạy mesh thừa).
+        _ck()
         log_fn(f"\n  Creating FEM mesh (max element = {mesh_size}m)...", "info")
         mesh_fn = find_method(model, ["mesh_model", "generate_mesh", "mesh", "calc_all"])
         if not mesh_fn:
@@ -2541,6 +2560,13 @@ def run_conversion(config: dict, log_fn) -> bool:
             log_fn("\n✗ Failed to save file!", "error")
             return False
 
+    except ConversionCancelled:
+        log_fn("\n⏹ Stopped by user — closing RAM Concept...", "warning")
+        for fn in ["shut_down","shutdown","close","exit","quit"]:
+            if hasattr(concept, fn):
+                try: getattr(concept, fn)(); break
+                except: pass
+        return "cancelled"
     except AttributeError as e:
         log_fn(f"[ERROR] AttributeError: {e}", "error")
         for fn in ["shut_down","shutdown","close","exit","quit"]:
@@ -2825,6 +2851,9 @@ class App(tk.Tk):
         self._layer_map = {"slabs": [], "columns": "", "walls": "", "openings": ""}
         self._dxf_layers: list = []
 
+        # Cờ yêu cầu dừng việc mesh đang chạy (cooperative cancel)
+        self._cancel = threading.Event()
+
         self._build_ui()
 
     # ── Widget helpers ────────────────────────────────────────
@@ -2968,12 +2997,23 @@ class App(tk.Tk):
         self.status_lbl = tk.Label(btn_row, text="Ready",
                                    bg=BG_DARK, fg=TEXT_SEC, font=FONT_SMALL)
         self.status_lbl.pack(side="left")
-        tk.Button(btn_row, text="▶  Run Conversion",
+        self.btn_run = tk.Button(btn_row, text="▶  Run Conversion",
                   bg=ACCENT, fg="white",
                   activebackground="#3A6FE8", activeforeground="white",
                   relief="flat", font=FONT_BOLD,
                   padx=24, pady=8, cursor="hand2",
-                  command=self._run).pack(side="right")
+                  command=self._run)
+        self.btn_run.pack(side="right")
+
+        self.btn_stop = tk.Button(btn_row, text="■  Stop",
+                  bg=ERROR, fg="white",
+                  activebackground="#C84A4A", activeforeground="white",
+                  disabledforeground="#7A4A4A",
+                  relief="flat", font=FONT_BOLD,
+                  padx=18, pady=8, cursor="hand2",
+                  state="disabled",
+                  command=self._stop)
+        self.btn_stop.pack(side="right", padx=(0, 8))
 
         self._style_widgets()
 
@@ -3270,16 +3310,41 @@ class App(tk.Tk):
         self._log("══════════════════════════════════════", "title")
         self.status_lbl.config(text="Processing...", fg=WARNING)
         self.progress.start(12)
+        self._cancel.clear()
+        self._set_running(True)
 
         def worker():
-            ok = run_conversion(config, self._log)
-            self.after(0, self._done, ok)
+            try:
+                result = run_conversion(config, self._log, self._cancel.is_set)
+            except ConversionCancelled:
+                result = "cancelled"
+            except Exception as e:
+                self._log(f"[ERROR] {e}", "error")
+                result = False
+            self.after(0, self._done, result)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _done(self, ok):
+    def _set_running(self, running: bool):
+        """Bật/tắt nút Run vs Stop khi đang chạy."""
+        self.btn_run.config(state="disabled" if running else "normal")
+        self.btn_stop.config(state="normal" if running else "disabled")
+
+    def _stop(self):
+        """Yêu cầu dừng việc dựng model/mesh đang chạy."""
+        self._cancel.set()
+        self.btn_stop.config(state="disabled")
+        self.status_lbl.config(text="Stopping…", fg=WARNING)
+        self._log("\n⏹ Stop requested — sẽ dừng ở checkpoint an toàn kế tiếp…",
+                  "warning")
+
+    def _done(self, result):
         self.progress.stop()
-        if ok:
+        self._set_running(False)
+        if result == "cancelled":
+            self.status_lbl.config(text="⏹ Stopped", fg=WARNING)
+            self._log("\n══ STOPPED BY USER ══", "warning")
+        elif result:
             self.status_lbl.config(text="✓ Done!", fg=SUCCESS)
             self._log("\n══ COMPLETED ══", "success")
             messagebox.showinfo("Success",

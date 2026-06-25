@@ -689,12 +689,18 @@ def read_legend(dxf_path, hatch_layer="LOAD_HATCH"):
             amax = max(areas)
             swatches = [h for h, a in zip(hatches, areas) if a <= 0.3 * amax] or hatches
 
+        # Token KHONG phai ten zone: chu thich tai (vd 'Wu=-25kN', 'Fz=200',
+        # 'S30/L20', 'S-0.5', 'L2.5'). Ten zone that la nhan mo ta (TERRACE,
+        # PLANTER, STORAGE...) -> tranh nhan nham file point/line load lam area.
+        not_name = re.compile(r"=|kN|^[SL]-?\.?\d", re.I)
+
         def _row(cy, ty, cx):
             """Tra ve (name, name_x, [nums]) cua hang. Chi lay so BEN PHAI ten (cot SIDL/LL);
             bo so thu tu (1,2,3...) nam giua swatch va ten."""
             band = sorted([(xx, tt) for xx, yy, tt in texts if abs(yy - cy) < ty and xx > cx])
             words = [(xx, tt) for xx, tt in band
-                     if not num_re.fullmatch(tt) and not tt.startswith("(")]
+                     if not num_re.fullmatch(tt) and not tt.startswith("(")
+                     and not not_name.search(tt)]
             name = words[0][1] if words else None
             name_x = words[0][0] if words else None
             ref = name_x if name_x is not None else cx
